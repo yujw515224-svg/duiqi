@@ -509,7 +509,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         sam_mask_shape_list,
         max_new_tokens=32,
     ):
-        with torch.inference_mode():
+        with torch.no_grad():
             attention_mask = (input_ids != self.config.pad_token_id).long().to(input_ids.device)
 
             outputs = self.generate(

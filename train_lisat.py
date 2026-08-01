@@ -923,7 +923,7 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     return train_iter, (epoch + 1) * args.steps_per_epoch
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def validate_seg(val_loader, model_engine, global_iters, args):
     """Validate segmentation and report paper-friendly binary mask metrics."""
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
@@ -1085,7 +1085,7 @@ def validate_seg(val_loader, model_engine, global_iters, args):
     return metrics
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def validate_vqa(
     vqa_file,
     model_engine,
