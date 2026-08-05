@@ -146,9 +146,12 @@ class LisatMetaModel(nn.Module):
         else:
             self.vision_pretrained = kwargs.get("vision_pretrained", None)
 
-        self.initialize_lisat_modules(self.config)
+        self.lisat_modules_initialized = False
 
     def initialize_lisat_modules(self, config):
+        if self.lisat_modules_initialized:
+            raise RuntimeError("initialize_lisat_modules() must be called only once.")
+
         # Build SAM
         self.visual_model = build_sam_vit_h(self.vision_pretrained)
         for param in self.visual_model.parameters():
@@ -194,6 +197,7 @@ class LisatMetaModel(nn.Module):
             )
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
+        self.lisat_modules_initialized = True
 
     @property
     def evidence_adapter(self):
@@ -266,6 +270,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         self.model = LisatModel(config, **kwargs)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        # Build SAM, [SEG] projector, and optional DIA modules after HF
+        # post_init() so generic LLaMA initialization cannot overwrite them.
+        # This is still part of model construction; from_pretrained() loads
+        # checkpoint weights only after __init__ returns.
+        self.model.initialize_lisat_modules(self.model.config)
 
     def forward(self, **kwargs):
         if "past_key_values" in kwargs:
