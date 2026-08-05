@@ -67,7 +67,13 @@ METRIC_FIELDS = [
     "mask_bce_loss",
     "mask_dice_loss",
     "mask_loss",
+    "attn_alignment_loss",
     "attn_loss",
+    "num_positive_masks",
+    "num_valid_attn_masks",
+    "res_scale",
+    "gate_mean",
+    "attention_entropy",
     "lr",
     "val_giou",
     "val_ciou",
@@ -370,10 +376,10 @@ def save_best_checkpoint(model_engine, args, epoch, global_iters, metrics):
 
 def parse_args(args):
     """Define and parse training arguments."""
-    parser = argparse.ArgumentParser(description="Train LISAT Model")
+    parser = argparse.ArgumentParser(description="Train DIA-LISAt Model")
 
     # Model paths
-    parser.add_argument("--version", default="/root/autodl-tmp/DIA-LISAt_code/model/LISAt-7b-local-remoteclip")
+    parser.add_argument("--version", default="/root/autodl-tmp/DIA-LISAt_code/model/LISAT_PRE-7b-local-remoteclip")
     parser.add_argument("--vision-tower", default="/root/autodl-tmp/DIA-LISAt_code/model/remote_clip_vit_l_14")
     # Precision settings
     parser.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
@@ -382,11 +388,14 @@ def parse_args(args):
 
     # Image and input settings
     parser.add_argument("--image_size", type=int, default=1024)
-    parser.add_argument("--model_max_length", type=int, default=512)
+    parser.add_argument("--model_max_length", type=int, default=1024)
 
     # Dataset and training configuration
-    parser.add_argument("--dataset", default="geo_reason_seg")
-    parser.add_argument("--sample_rates", default="1")
+    parser.add_argument(
+        "--dataset",
+        default="sem_seg||refer_seg||correct_refer_seg||vqa||neg_refer_seg||reason_seg||geo_reason_seg",
+    )
+    parser.add_argument("--sample_rates", default="15,15,2,30,1,1,36")
     parser.add_argument("--sem_seg_data", default="ade20k||cocostuff||pascal_part||paco_lvis")
     parser.add_argument("--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog")
     parser.add_argument("--neg_refer_seg_data", default="R-refcocog||R-refcoco||R-refcoco+")
@@ -409,20 +418,20 @@ def parse_args(args):
     parser.add_argument("--vis_dir", default="", help="Optional visualization output directory. Defaults to log_dir/visualizations.")
 
     # Directories
-    parser.add_argument("--dataset_dir", default="/root/autodl-tmp/DIA-LISAt_code/dataset")
+    parser.add_argument("--dataset_dir", default="/root/autodl-tmp/LISAt_code/dataset")
     parser.add_argument("--log_base_dir", default="/root/autodl-tmp/DIA-LISAt_code/runs")
-    parser.add_argument("--exp_name", default="dia_lisat_gres_speedmem")
+    parser.add_argument("--exp_name", default="dia_lisat_lr5e")
 
     # Training hyperparameters
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--steps_per_epoch", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--val_batch_size", type=int, default=1)
-    parser.add_argument("--grad_accumulation_steps", type=int, default=8)
-    parser.add_argument("--zero_stage", type=int, choices=[1, 2, 3], default=3)
-    parser.add_argument("--zero_bucket_size", type=float, default=2e8)
+    parser.add_argument("--grad_accumulation_steps", type=int, default=4)
+    parser.add_argument("--zero_stage", type=int, choices=[1, 2, 3], default=2)
+    parser.add_argument("--zero_bucket_size", type=float, default=5e7)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.0003)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--ce_loss_weight", type=float, default=1.0)
     parser.add_argument("--dice_loss_weight", type=float, default=0.5)
     parser.add_argument("--bce_loss_weight", type=float, default=2.0)
@@ -432,18 +441,29 @@ def parse_args(args):
     parser.add_argument("--lora_target_modules", default="q_proj,v_proj")
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
-    parser.add_argument("--num_classes_per_sample", type=int, default=1)
+    parser.add_argument("--num_classes_per_sample", type=int, default=3)
 
     # Training control
     parser.add_argument("--no_eval", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--resume", default="")
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--auto_resume",
+        dest="auto_resume",
+        action="store_true",
+    )
+    resume_group.add_argument(
+        "--no_auto_resume",
+        dest="auto_resume",
+        action="store_false",
+    )
+    parser.set_defaults(auto_resume=False)
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--print_freq", type=int, default=10)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--train_mask_decoder", action="store_true", default=True)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
-    parser.add_argument("--auto_resume", action="store_true", default=True)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--conv_type", choices=["llava_v1", "llava_llama_2"], default="llava_v1")
     parser.add_argument("--vision_pretrained", default="/root/autodl-tmp/DIA-LISAt_code/sam_vit_h_4b8939.pth")
@@ -454,9 +474,22 @@ def parse_args(args):
     parser.add_argument("--vqa_eval_file_sydney", default="./dataset/vqa_caption/Sydney-Captions.jsonl")
     parser.add_argument("--vqa_eval_file_ucm", default="./dataset/vqa_caption/UCM-Captions.jsonl")
 
-    parser.add_argument("--attn_loss_weight", type=float, default=0.1)
+    parser.add_argument("--attn_loss_weight", type=float, default=0.02)
     parser.add_argument("--dia_num_heads", type=int, default=8)
-    parser.add_argument("--dia_num_evidence_tokens", type=int, default=4)
+    parser.add_argument("--dia_num_evidence_tokens", type=int, default=1)
+    parser.add_argument("--dia_attn_dropout", type=float, default=0.0)
+    parser.add_argument("--fusion_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--init_con_from_seg",
+        dest="init_con_from_seg",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_init_con_from_seg",
+        dest="init_con_from_seg",
+        action="store_false",
+    )
+    parser.set_defaults(init_con_from_seg=True)
 
     return parser.parse_args(args)
 
@@ -469,6 +502,21 @@ def main(args):
         os.makedirs(args.log_dir, exist_ok=True)
         save_run_args(args)
         wandb.init(project="lisat", name=args.exp_name)
+        print(
+            "[Startup] "
+            f"starting_from={args.version}, "
+            f"manual_resume={args.resume or None}, "
+            f"auto_resume={args.auto_resume}"
+        )
+        print(
+            "[DIA] "
+            f"K={args.dia_num_evidence_tokens}, "
+            f"heads={args.dia_num_heads}, "
+            f"attention_dropout={args.dia_attn_dropout}, "
+            f"fusion_dropout={args.fusion_dropout}, "
+            f"attention_loss_weight={args.attn_loss_weight}, "
+            f"init_con_from_seg={args.init_con_from_seg}"
+        )
 
     # ---- Init conversation template ----
     conversation_lib.default_conversation = conversation_lib.conv_templates[args.conv_type]
@@ -486,6 +534,8 @@ def main(args):
         "attn_loss_weight": args.attn_loss_weight,
         "dia_num_heads": args.dia_num_heads,
         "dia_num_evidence_tokens": args.dia_num_evidence_tokens,
+        "dia_attn_dropout": args.dia_attn_dropout,
+        "fusion_dropout": args.fusion_dropout,
 
     }
     tokenizer, model, vision_tower = init_LISAT_model(args, model_args)
@@ -541,11 +591,12 @@ def main(args):
             val_dataset = ReasonSegDataset(
                 args.dataset_dir,
                 vision_tower.image_processor,
-                samples_per_epoch=200,
+                samples_per_epoch=args.eval_samples,
                 image_size=args.image_size,
                 num_classes_per_sample=3,
-                reason_seg_data="GeoReasonSeg|val",
+                reason_seg_data=f"GeoReasonSeg|{args.eval_split}",
                 use_fp=False,
+                is_train=False,
             )
             print(f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples.")
     else:
@@ -580,7 +631,10 @@ def main(args):
         "zero_optimization": {
             "stage": args.zero_stage,
             "contiguous_gradients": True,
-            "overlap_comm": args.zero_stage != 3,
+            # Match the stable baseline recipe for mixed batches whose ranks can
+            # exercise different optional branches, such as VQA vs segmentation.
+            "overlap_comm": False,
+            "ignore_unused_parameters": True,
             "reduce_scatter": True,
             "reduce_bucket_size": args.zero_bucket_size,
             "allgather_bucket_size": args.zero_bucket_size,
@@ -617,13 +671,22 @@ def main(args):
         maybe_resume = os.path.join(args.log_dir, "ckpt_model")
         if os.path.exists(maybe_resume):
             args.resume = maybe_resume
+            if args.local_rank == 0:
+                print(f"[Resume] auto-resume found checkpoint: {args.resume}")
+        elif args.local_rank == 0:
+            print("[Resume] auto_resume=True but no ckpt_model was found.")
+    elif args.local_rank == 0:
+        print(
+            "[Resume] "
+            f"auto_resume={args.auto_resume}, manual_resume={args.resume or None}"
+        )
 
     if args.resume:
         load_path, client_state = model_engine.load_checkpoint(args.resume)
         with open(os.path.join(args.resume, "latest"), "r") as f:
             ckpt_dir = f.readlines()[0].strip()
         args.start_epoch = int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        print(f"Resume training from {args.resume}, start from epoch {args.start_epoch}")
+        print(f"[Resume] loaded={load_path}, start_epoch={args.start_epoch}")
 
     # ---- Validation DataLoader ----
     if val_dataset is not None:
@@ -866,7 +929,19 @@ def main(args):
 
 def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     """Main training loop (one epoch)."""
-    keys = ["loss", "ce_loss", "mask_bce_loss", "mask_dice_loss", "mask_loss", "attn_loss"]
+    keys = [
+        "loss",
+        "ce_loss",
+        "mask_bce_loss",
+        "mask_dice_loss",
+        "mask_loss",
+        "attn_alignment_loss",
+        "num_positive_masks",
+        "num_valid_attn_masks",
+        "res_scale",
+        "gate_mean",
+        "attention_entropy",
+    ]
     loss_meters = {k: AverageMeter(k, ":.4f") for k in keys}
 
     progress = ProgressMeter(
@@ -1098,11 +1173,15 @@ def validate_vqa(
     max_new_tokens=256,
 ):
     """Validate on a vqa dataset (NWPU, Sydney, UCM)."""
+    if not os.path.exists(vqa_file):
+        print(f"[WARN] Skip VQA validation because file is missing: {vqa_file}")
+        return 0.0
     if Bleu is None:
-        raise RuntimeError(
-            "pycocoevalcap is required for VQA evaluation. "
-            "Use --no_eval for RefSegRS-only training or install pycocoevalcap."
+        print(
+            "[WARN] Skip VQA validation because pycocoevalcap is not installed: "
+            f"{vqa_file}"
         )
+        return 0.0
     device = next(model_engine.parameters()).device
     model_engine.eval()
     conversation_lib.default_conversation = conversation_lib.conv_templates[conv_type]

@@ -50,12 +50,10 @@ def collate_fn_train(batch, tokenizer=None, conv_type="llava_v1", use_mm_start_e
     if use_mm_start_end:
         conversation_list = replace_image_tokens(conversation_list)
 
-    # # DIA-LISA uses [CON] as the evidence-retrieval token and [SEG] as the mask-prompt token.
-    # Keep the transformation idempotent because some templates may already contain [CON].
-    conversation_list = [
-        text.replace(f"[CON] [SEG]", "[SEG]").replace("[SEG]", "[CON] [SEG]")
-        for text in conversation_list
-    ]
+    # Pure structural DIA keeps the original LISAt text target: [SEG].
+    # The model builds the concept/evidence branch internally from the same
+    # hidden state that predicts [SEG], so loading LISAt_PRE remains behaviorally
+    # aligned with the original baseline before the DIA residual learns to move.
 
     # Tokenization and padding of input IDs
     input_ids, attention_masks = tokenize_and_pad(conversation_list, tokenizer)
@@ -181,7 +179,8 @@ class HybridDataset(torch.utils.data.Dataset):
                         image_size,
                         num_classes_per_sample,
                         reason_seg_data,
-                        use_fp=True # Enable false premise QA
+                        use_fp=True,  # Enable false premise QA
+                        is_train=True,
                     )
                 )
             elif dataset == "geo_reason_seg":
@@ -193,7 +192,8 @@ class HybridDataset(torch.utils.data.Dataset):
                         image_size,
                         num_classes_per_sample,
                         reason_seg_data=geo_reason_seg_data,
-                        use_fp=False  # Disable false premise QA
+                        use_fp=False,  # Disable false premise QA
+                        is_train=True,
                     )
                 )
             elif dataset == "refsegrs":
@@ -276,12 +276,10 @@ def collate_fn_val(batch, tokenizer=None, use_mm_start_end=True, padding="right"
     if use_mm_start_end:
         conversation_list = replace_image_tokens(conversation_list)
 
-    # # DIA-LISA uses [CON] as the evidence-retrieval token and [SEG] as the mask-prompt token.
-    # Keep the transformation idempotent because some templates may already contain [CON].
-    conversation_list = [
-        text.replace(f"[CON] [SEG]", "[SEG]").replace("[SEG]", "[CON] [SEG]")
-        for text in conversation_list
-    ]
+    # Pure structural DIA keeps the original LISAt text target: [SEG].
+    # The model builds the concept/evidence branch internally from the same
+    # hidden state that predicts [SEG], so loading LISAt_PRE remains behaviorally
+    # aligned with the original baseline before the DIA residual learns to move.
 
     # Tokenization and padding of input IDs
     input_ids, attention_masks = tokenize_and_pad(conversation_list, tokenizer, padding=padding)

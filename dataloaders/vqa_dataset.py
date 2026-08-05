@@ -64,7 +64,7 @@ class VQADataset(BaseDataset):
             conv.append_message(role, sentence["value"])
         conversations.append(conv.get_prompt())
         # Empty segmentation maps for VQA datasets
-        masks = torch.rand(0, *sam_input_shape)
+        masks = torch.empty(0, *sam_input_shape, dtype=torch.float32)
         exists = [False]
         sam_mask_shape = [sam_input_shape, (masks.shape[1], masks.shape[2])]
         return (
@@ -75,4 +75,6 @@ class VQADataset(BaseDataset):
             masks,                      # segmentation GT
             sam_mask_shape,             # input / output shape for SAM
             exists,                     # object existence
+            None,                       # ref_id
+            None,                       # sent_id
         )

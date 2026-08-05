@@ -15,7 +15,7 @@ MASTER_PORT="${MASTER_PORT:-16140}"
 # DIA-LISAt on GRES / GeoReasonSeg. The batch/ZeRO settings mirror the safe
 # baseline run on 2x RTX 4090, while keeping outputs in a separate DIA folder.
 deepspeed --master_port "${MASTER_PORT}" train_lisat.py \
-  --version ./model/LISAt-7b-local-remoteclip \
+  --version ./model/LISAT_PRE-7b-local-remoteclip \
   --vision-tower ./model/remote_clip_vit_l_14 \
   --vision_pretrained ./sam_vit_h_4b8939.pth \
   --dataset_dir ./dataset \
@@ -39,6 +39,9 @@ deepspeed --master_port "${MASTER_PORT}" train_lisat.py \
   --print_freq 10 \
   --save_visualizations \
   --vis_samples 16 \
-  --attn_loss_weight 0.1 \
+  --attn_loss_weight 0.02 \
   --dia_num_heads 8 \
-  --dia_num_evidence_tokens 4
+  --dia_num_evidence_tokens 1 \
+  --dia_attn_dropout 0.0 \
+  --fusion_dropout 0.0 \
+  --no_auto_resume

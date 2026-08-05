@@ -220,3 +220,8 @@ lisa_env_before_lisat_update_*.txt
 /model/sam_vit_h_4b8939.pth
 /sam_vit_h_4b8939.pth
 /dataset
+
+model/LISAT_PRE-7b/
+model/LISAT_PRE-7b-local-remoteclip/
+model/LISAT_PRE-7b-local-remoteclip
+model/LISAT_PRE-7b

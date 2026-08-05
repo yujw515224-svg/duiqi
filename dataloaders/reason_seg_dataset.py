@@ -28,9 +28,11 @@ class ReasonSegDataset(BaseDataset):
         num_classes_per_sample: int = 3,
         reason_seg_data="ReasonSeg|train",
         use_fp=True,  # Enable or disable false premise QA
+        is_train: bool = True,
     ):
         super().__init__(vision_tower, samples_per_epoch, image_size)
         self.use_fp = use_fp  # Store the use_fp flag
+        self.is_train = is_train
         self.num_classes_per_sample = num_classes_per_sample
         self.base_image_dir = base_image_dir
 
@@ -82,16 +84,23 @@ class ReasonSegDataset(BaseDataset):
                         data_pairs.append((image_path, json_path))
                     else:
                         print(f"Image path does not exist: {image_path}")
-        self.reason_seg_data = data_pairs
+        self.reason_seg_data = sorted(data_pairs)
 
         print("number of reason_seg samples: ", len(data_pairs))
 
     def __len__(self):
+        if self.is_train:
+            return self.samples_per_epoch
+        if self.samples_per_epoch and self.samples_per_epoch > 0:
+            return min(self.samples_per_epoch, len(self.reason_seg_data))
         return len(self.reason_seg_data)
 
     def __getitem__(self, idx):
         data_pairs = self.reason_seg_data
-        idx = random.randint(0, len(data_pairs) - 1)
+        if self.is_train:
+            idx = random.randint(0, len(data_pairs) - 1)
+        else:
+            idx = idx % len(data_pairs)
 
         image_path, json_path = data_pairs[idx]
 
@@ -102,18 +111,17 @@ class ReasonSegDataset(BaseDataset):
         mask, sents, fp_qa, is_sentence = get_mask_from_json(json_path, img)
 
         # Decide the mode for this turn
-        if self.use_fp:
+        if self.is_train and self.use_fp:
             mode_this_turn = random.choices(self.choices, self.weights, k=1)[0]
         else:
             mode_this_turn = "True_Premise"  # Always use True_Premise when use_fp is False
 
         # Sampling positive examples
         sample_size = min(len(sents), self.num_classes_per_sample)
-        sampled_inds = (
-            random.sample(range(len(sents)), sample_size)
-            if len(sents) >= self.num_classes_per_sample
-            else list(range(len(sents)))
-        )
+        if self.is_train and len(sents) >= self.num_classes_per_sample:
+            sampled_inds = random.sample(range(len(sents)), sample_size)
+        else:
+            sampled_inds = list(range(sample_size))
         sampled_sents = [sents[idx] for idx in sampled_inds]
         sampled_masks = [
             (mask == 1).astype(np.float32) for _ in range(len(sampled_inds))
@@ -121,18 +129,17 @@ class ReasonSegDataset(BaseDataset):
 
         # Initialize variables for negative samples
         neg_sampled_sents = []
-        if self.use_fp and mode_this_turn == "False_Premise_Correction":
+        if self.is_train and self.use_fp and mode_this_turn == "False_Premise_Correction":
             if len(fp_qa) == 0:
                 # If fp_qa is empty, default to True_Premise
                 mode_this_turn = "True_Premise"
             else:
                 # Sampling negative examples
                 neg_sample_size = min(len(fp_qa), self.num_classes_per_sample)
-                neg_sampled_inds = (
-                    random.sample(range(len(fp_qa)), neg_sample_size)
-                    if len(fp_qa) >= self.num_classes_per_sample
-                    else list(range(len(fp_qa)))
-                )
+                if len(fp_qa) >= self.num_classes_per_sample:
+                    neg_sampled_inds = random.sample(range(len(fp_qa)), neg_sample_size)
+                else:
+                    neg_sampled_inds = list(range(len(fp_qa)))
                 neg_sampled_sents = [fp_qa[idx] for idx in neg_sampled_inds]
 
         # Create Q/A Data
@@ -143,12 +150,24 @@ class ReasonSegDataset(BaseDataset):
         if mode_this_turn == "True_Premise":
             for idx, text in enumerate(sampled_sents):
                 if is_sentence:
-                    question_template = random.choice(self.long_question_list)
+                    question_template = (
+                        random.choice(self.long_question_list)
+                        if self.is_train
+                        else self.long_question_list[0]
+                    )
                     questions.append(question_template.format(sent=text))
                 else:
-                    question_template = random.choice(self.short_question_list)
+                    question_template = (
+                        random.choice(self.short_question_list)
+                        if self.is_train
+                        else self.short_question_list[0]
+                    )
                     questions.append(question_template.format(class_name=text.lower()))
-                answers.append(random.choice(self.answer_list))
+                answers.append(
+                    random.choice(self.answer_list)
+                    if self.is_train
+                    else self.answer_list[0]
+                )
 
                 conv = conversation_lib.default_conversation.copy()
                 conv.append_message(conv.roles[0], questions[-1])
