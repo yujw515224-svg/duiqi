@@ -165,6 +165,33 @@ def save_run_args(args):
             writer.writerow({"name": name, "value": _stringify_config_value(args_dict[name])})
 
 
+def _check_resume_mode_compatibility(args):
+    """Best-effort guard against mixing baseline and DIA checkpoints."""
+    if not args.resume:
+        return
+
+    resume_dir = args.resume
+    candidates = [
+        os.path.join(resume_dir, "args.json"),
+        os.path.join(os.path.dirname(resume_dir), "args.json"),
+    ]
+    for args_path in candidates:
+        if not os.path.exists(args_path):
+            continue
+        with open(args_path, "r", encoding="utf-8") as handle:
+            saved_args = json.load(handle)
+        if "use_dia" not in saved_args:
+            return
+        saved_use_dia = bool(saved_args["use_dia"])
+        if saved_use_dia != bool(args.use_dia):
+            raise RuntimeError(
+                "Resume mode mismatch: checkpoint was created with "
+                f"use_dia={saved_use_dia}, but current run has "
+                f"use_dia={args.use_dia}."
+            )
+        return
+
+
 def append_metrics(args, metrics):
     if getattr(args, "local_rank", 0) != 0:
         return
@@ -474,11 +501,22 @@ def parse_args(args):
     parser.add_argument("--vqa_eval_file_sydney", default="./dataset/vqa_caption/Sydney-Captions.jsonl")
     parser.add_argument("--vqa_eval_file_ucm", default="./dataset/vqa_caption/UCM-Captions.jsonl")
 
+    parser.add_argument(
+        "--use_dia",
+        action="store_true",
+        default=False,
+        help="Enable DIA-LISAt modules. Default False keeps the original LISAt path.",
+    )
     parser.add_argument("--attn_loss_weight", type=float, default=0.02)
     parser.add_argument("--dia_num_heads", type=int, default=8)
     parser.add_argument("--dia_num_evidence_tokens", type=int, default=1)
     parser.add_argument("--dia_attn_dropout", type=float, default=0.0)
     parser.add_argument("--fusion_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--dia_bypass_fusion",
+        action="store_true",
+        help="Debug only: send raw [SEG] projector output to SAM and bypass DIA fusion.",
+    )
     parser.add_argument(
         "--init_con_from_seg",
         dest="init_con_from_seg",
@@ -509,13 +547,20 @@ def main(args):
             f"auto_resume={args.auto_resume}"
         )
         print(
+            "[Mode] "
+            f"use_dia={args.use_dia}, "
+            f"dia_con_source={'seg_hidden_dual_projector' if args.use_dia else None}, "
+            "explicit_con_in_conversation=False"
+        )
+        print(
             "[DIA] "
             f"K={args.dia_num_evidence_tokens}, "
             f"heads={args.dia_num_heads}, "
             f"attention_dropout={args.dia_attn_dropout}, "
             f"fusion_dropout={args.fusion_dropout}, "
             f"attention_loss_weight={args.attn_loss_weight}, "
-            f"init_con_from_seg={args.init_con_from_seg}"
+            f"init_con_from_seg={args.init_con_from_seg}, "
+            f"dia_bypass_fusion={args.dia_bypass_fusion}"
         )
 
     # ---- Init conversation template ----
@@ -531,11 +576,13 @@ def main(args):
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
-        "attn_loss_weight": args.attn_loss_weight,
+        "use_dia": args.use_dia,
+        "attn_loss_weight": args.attn_loss_weight if args.use_dia else 0.0,
         "dia_num_heads": args.dia_num_heads,
         "dia_num_evidence_tokens": args.dia_num_evidence_tokens,
         "dia_attn_dropout": args.dia_attn_dropout,
         "fusion_dropout": args.fusion_dropout,
+        "dia_bypass_fusion": args.dia_bypass_fusion,
 
     }
     tokenizer, model, vision_tower = init_LISAT_model(args, model_args)
@@ -682,11 +729,12 @@ def main(args):
         )
 
     if args.resume:
+        _check_resume_mode_compatibility(args)
         load_path, client_state = model_engine.load_checkpoint(args.resume)
         with open(os.path.join(args.resume, "latest"), "r") as f:
             ckpt_dir = f.readlines()[0].strip()
         args.start_epoch = int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        print(f"[Resume] loaded={load_path}, start_epoch={args.start_epoch}")
+        print(f"[Resume] loaded_checkpoint={load_path}, start_epoch={args.start_epoch}")
 
     # ---- Validation DataLoader ----
     if val_dataset is not None:
@@ -1155,6 +1203,12 @@ def validate_seg(val_loader, model_engine, global_iters, args):
             f"pred_fg={metrics['val_pred_fg_frac']:.4f}, "
             f"gt_fg={metrics['val_gt_fg_frac']:.4f}"
         )
+        if metrics["val_pred_fg_frac"] <= 1e-8 and metrics["val_gt_fg_frac"] > 0:
+            print(
+                "[WARN] Validation predictions collapsed to all background "
+                f"at mask_threshold={args.mask_threshold}. Check training "
+                "initialization, checkpoint compatibility, and mask logits."
+            )
 
     model_engine.train()
     return metrics

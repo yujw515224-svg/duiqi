@@ -51,6 +51,8 @@ DIA_NUM_HEADS="${DIA_NUM_HEADS:-8}"
 DIA_ATTN_DROPOUT="${DIA_ATTN_DROPOUT:-0.0}"
 FUSION_DROPOUT="${FUSION_DROPOUT:-0.0}"
 ATTN_LOSS_WEIGHT="${ATTN_LOSS_WEIGHT:-0.02}"
+DIA_BYPASS_FUSION="${DIA_BYPASS_FUSION:-0}"
+USE_DIA="${USE_DIA:-1}"
 
 RUN_BACKGROUND="${RUN_BACKGROUND:-0}"
 LOG_FILE="${LOG_FILE:-${LOG_BASE_DIR}/${EXP_NAME}_train.log}"
@@ -89,13 +91,27 @@ ARGS=(
   --workers "$WORKERS"
   --save_visualizations
   --vis_samples "$VIS_SAMPLES"
-  --dia_num_evidence_tokens "$DIA_NUM_EVIDENCE_TOKENS"
-  --dia_num_heads "$DIA_NUM_HEADS"
-  --dia_attn_dropout "$DIA_ATTN_DROPOUT"
-  --fusion_dropout "$FUSION_DROPOUT"
-  --attn_loss_weight "$ATTN_LOSS_WEIGHT"
-  --init_con_from_seg
 )
+
+if [ "${USE_DIA}" = "1" ]; then
+  ARGS+=(
+    --use_dia
+    --dia_num_evidence_tokens "$DIA_NUM_EVIDENCE_TOKENS"
+    --dia_num_heads "$DIA_NUM_HEADS"
+    --dia_attn_dropout "$DIA_ATTN_DROPOUT"
+    --fusion_dropout "$FUSION_DROPOUT"
+    --attn_loss_weight "$ATTN_LOSS_WEIGHT"
+  )
+  if [ "${DIA_BYPASS_FUSION}" = "1" ]; then
+    ARGS+=(--dia_bypass_fusion)
+  fi
+
+  if [ "${INIT_CON_FROM_SEG:-1}" = "1" ]; then
+    ARGS+=(--init_con_from_seg)
+  else
+    ARGS+=(--no_init_con_from_seg)
+  fi
+fi
 
 if [ -n "$RESUME" ]; then
   ARGS+=(--resume "$RESUME")
@@ -115,7 +131,10 @@ echo "  dataset_dir: ${DATASET_DIR}"
 echo "  lr=${LR}, epochs=${EPOCHS}, steps_per_epoch=${STEPS_PER_EPOCH}"
 echo "  batch_size=${BATCH_SIZE}, grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS}"
 echo "  zero_stage=${ZERO_STAGE}, zero_bucket_size=${ZERO_BUCKET_SIZE}"
-echo "  DIA: K=${DIA_NUM_EVIDENCE_TOKENS}, heads=${DIA_NUM_HEADS}, attn_dropout=${DIA_ATTN_DROPOUT}, attn_loss_weight=${ATTN_LOSS_WEIGHT}"
+echo "  use_dia=${USE_DIA}"
+if [ "${USE_DIA}" = "1" ]; then
+  echo "  DIA: K=${DIA_NUM_EVIDENCE_TOKENS}, heads=${DIA_NUM_HEADS}, attn_dropout=${DIA_ATTN_DROPOUT}, attn_loss_weight=${ATTN_LOSS_WEIGHT}, bypass_fusion=${DIA_BYPASS_FUSION}"
+fi
 
 mkdir -p "$LOG_BASE_DIR"
 

@@ -73,17 +73,24 @@ def compute_dia_loss_components(
         if num_gt == 0:
             continue
 
-        gt_mask = gt_mask.to(device=pred_mask.device, dtype=pred_mask.dtype)
+        gt_mask = gt_mask.to(device=pred_mask.device)
         if pred_mask.shape != gt_mask.shape:
             raise RuntimeError(
                 f"Mask shape mismatch: pred={pred_mask.shape}, gt={gt_mask.shape}"
             )
 
+        # Keep BCE/Dice in fp32 even when the model runs in bf16/fp16. Remote
+        # sensing targets are often tiny, and full-precision mask losses preserve
+        # the small foreground gradients that teach the decoder to leave the
+        # all-background solution.
+        pred_mask_for_loss = pred_mask.float()
+        gt_mask_for_loss = gt_mask.float()
+
         mask_bce_sum = mask_bce_sum + (
-            sigmoid_ce_loss(pred_mask, gt_mask, num_masks=num_gt) * num_gt
+            sigmoid_ce_loss(pred_mask_for_loss, gt_mask_for_loss, num_masks=num_gt) * num_gt
         )
         mask_dice_sum = mask_dice_sum + (
-            dice_loss(pred_mask, gt_mask, num_masks=num_gt) * num_gt
+            dice_loss(pred_mask_for_loss, gt_mask_for_loss, num_masks=num_gt) * num_gt
         )
 
         attn_maps = attn_maps_list[batch_idx]
@@ -131,6 +138,7 @@ class LisatMetaModel(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__(config)
         self.config = config
+        self.use_dia = getattr(config, "use_dia", False)
         if not hasattr(self.config, "train_mask_decoder"):
             self.config.train_mask_decoder = kwargs["train_mask_decoder"]
             self.config.out_dim = kwargs["out_dim"]
@@ -172,22 +180,25 @@ class LisatMetaModel(nn.Module):
         # self.text_hidden_fcs.train()
         
         self.text_hidden_fcs = nn.ModuleList([build_text_project()])
-        self.con_hidden_fcs = nn.ModuleList([build_text_project()])
-        self.context_adapter = ContextEvidenceAdapter(
-            dim=out_dim,
-            num_heads=getattr(config, "dia_num_heads", 8),
-            num_evidence_tokens=getattr(config, "dia_num_evidence_tokens", 1),
-            dropout=getattr(config, "dia_attn_dropout", 0.0),
-        )
-        self.evidence_fusion = EvidenceGuideFusion(
-            dim=out_dim,
-            dropout=getattr(config, "fusion_dropout", 0.0),
-        )
+        if self.use_dia:
+            self.con_hidden_fcs = nn.ModuleList([build_text_project()])
+            self.context_adapter = ContextEvidenceAdapter(
+                dim=out_dim,
+                num_heads=getattr(config, "dia_num_heads", 8),
+                num_evidence_tokens=getattr(config, "dia_num_evidence_tokens", 1),
+                dropout=getattr(config, "dia_attn_dropout", 0.0),
+            )
+            self.evidence_fusion = EvidenceGuideFusion(
+                dim=out_dim,
+                dropout=getattr(config, "fusion_dropout", 0.0),
+            )
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
 
     @property
     def evidence_adapter(self):
+        if not self.use_dia:
+            raise AttributeError("DIA evidence adapter is disabled because use_dia=False.")
         return self.context_adapter
 
 
@@ -213,11 +224,20 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         self.dice_loss_weight = kwargs.pop("dice_loss_weight", 0.5)
         self.bce_loss_weight = kwargs.pop("bce_loss_weight", 2.0)
 
-        self.con_token_idx = kwargs.pop("con_token_idx")
+        self.use_dia = kwargs.pop("use_dia", getattr(config, "use_dia", False))
+        config.use_dia = self.use_dia
+        self.con_token_idx = kwargs.pop("con_token_idx", None)
+        self.dia_bypass_fusion = kwargs.pop(
+            "dia_bypass_fusion",
+            getattr(config, "dia_bypass_fusion", False),
+        )
+        config.dia_bypass_fusion = self.dia_bypass_fusion
         self.attn_loss_weight = kwargs.pop(
             "attn_loss_weight",
             getattr(config, "attn_loss_weight", 0.02),
         )
+        if not self.use_dia:
+            self.attn_loss_weight = 0.0
         config.dia_num_heads = kwargs.pop("dia_num_heads", getattr(config, "dia_num_heads", 8))
         config.dia_num_evidence_tokens = kwargs.pop(
             "dia_num_evidence_tokens",
@@ -269,18 +289,26 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         return anchor
 
     def segmentation_zero_anchor(self, reference_loss):
+        modules = [
+            self.model.text_hidden_fcs,
+            self.model.visual_model.mask_decoder,
+        ]
+        if self.use_dia:
+            modules.extend(
+                [
+                    self.model.con_hidden_fcs,
+                    self.model.context_adapter,
+                    self.model.evidence_fusion,
+                ]
+            )
         return self._zero_anchor_for_modules(
             reference_loss,
-            [
-                self.model.text_hidden_fcs,
-                self.model.con_hidden_fcs,
-                self.model.context_adapter,
-                self.model.evidence_fusion,
-                self.model.visual_model.mask_decoder,
-            ],
+            modules,
         )
 
     def con_projector_zero_anchor(self, reference_loss):
+        if not self.use_dia:
+            return reference_loss.new_zeros(())
         return self._zero_anchor_for_modules(
             reference_loss,
             [self.model.con_hidden_fcs],
@@ -418,24 +446,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         return grouped
 
     def generate_pred_masks(self, seg_embeddings, con_embeddings, image_embeddings, sam_mask_shape_list):
-        """
-            用 DIA-LISA prompt 生成预测 mask。
+        """Generate predicted masks from SAM prompt embeddings.
 
-            seg_embeddings:
-                List[Tensor]
-                每张图对应的 [SEG] embeddings。
-
-            con_embeddings:
-                List[Tensor]
-                每张图对应的 [CON] embeddings。
-
-            image_embeddings:
-                [B, 256, 64, 64]
-                SAM image encoder 输出。
-
-            返回:
-                pred_masks: List[Tensor]
-                attn_maps_list: List[Tensor]
+        Baseline mode (use_dia=False) keeps the original LISAt behavior: a
+        single projected [SEG] embedding is sent to the SAM mask decoder. DIA
+        mode adds the [CON] evidence retrieval and zero-initialized fusion path.
         """
         multimask_output = False
         pred_masks = []
@@ -446,12 +461,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         }
         for i in range(len(seg_embeddings)):
             seg_i = seg_embeddings[i]
-            con_i = con_embeddings[i]
+            con_i = con_embeddings[i] if self.use_dia and con_embeddings is not None else None
 
             input_size, original_size = sam_mask_shape_list[i]
             input_size = (int(input_size[0]), int(input_size[1]))
             original_size = (int(original_size[0]), int(original_size[1]))
-            # 如果模型没有生成 [SEG]，就没有办法做 mask prompt  
             if seg_i.shape[0] == 0:
                 pred_masks.append(
                     torch.empty(
@@ -463,52 +477,62 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 )
                 attn_maps_list.append(None)
                 continue
-        # 如果只有一个 [CON]，但生成了多个 [SEG]，
-        # 就让同一个 concept query 服务多个 mask prompt
-            if con_i.shape[0] == 1 and seg_i.shape[0] > 1:
-                con_i = con_i.expand(seg_i.shape[0], -1)
-        # 如果完全没有 [CON]，说明生成不符合 DIA-LISA 格式。
-        # 这里用 [SEG] 作为 fallback，保证推理不直接崩
-            if con_i.shape[0] == 0:
-                con_i = seg_i
-            
-            num_prompts = min(seg_i.shape[0], con_i.shape[0])
-            seg_i = seg_i[:num_prompts]
-            con_i = con_i[:num_prompts]
+
+            if self.use_dia:
+                # Reuse one concept query for multiple prompts from the same image.
+                if con_i.shape[0] == 1 and seg_i.shape[0] > 1:
+                    con_i = con_i.expand(seg_i.shape[0], -1)
+                # Generated answers can still contain [SEG] without [CON]. Keep
+                # inference robust, but do not inject [CON] into the dataset.
+                if con_i.shape[0] == 0:
+                    con_i = seg_i
+
+                num_prompts = min(seg_i.shape[0], con_i.shape[0])
+                seg_i = seg_i[:num_prompts]
+                con_i = con_i[:num_prompts]
+            else:
+                num_prompts = seg_i.shape[0]
+                seg_i = seg_i[:num_prompts]
 
             decoder_dtype = next(self.model.visual_model.mask_decoder.parameters()).dtype
             decoder_device = image_embeddings.device
 
             seg_i = seg_i.to(device=decoder_device, dtype=decoder_dtype)
-            con_i = con_i.to(device=decoder_device, dtype=decoder_dtype)
+            if self.use_dia:
+                con_i = con_i.to(device=decoder_device, dtype=decoder_dtype)
 
             image_i = image_embeddings[i].unsqueeze(0).to(dtype=decoder_dtype)
-            # SAM dense positional encoding，用于让 evidence adapter 感知空间位置。
             image_pe = self.model.visual_model.prompt_encoder.get_dense_pe().to(
                 device=decoder_device, dtype=decoder_dtype
             )
-            # [CON] 从 SAM image feature 里检索 evidence tokens
-            evidence_tokens, attn_maps = self.model.context_adapter(
-                con_embeddings=con_i,
-                image_embeddings=image_i,
-                image_pe=image_pe,
-            )
-            # 融合 [SEG]、[CON]、evidence，得到 SAM text prompt tokens
-            prompt_tokens = self.model.evidence_fusion(
-                seg_embeddings=seg_i,
-                con_embeddings=con_i,
-                evidence_tokens=evidence_tokens,
-            )
-            gate_mean = getattr(self.model.evidence_fusion, "last_gate_mean", None)
-            if gate_mean is not None:
-                debug_stats["gate_means"].append(gate_mean)
-            flat_attn = attn_maps.detach().flatten(-2).clamp_min(1e-8)
-            debug_stats["attention_entropies"].append(
-                -(flat_attn * flat_attn.log()).sum(dim=-1).mean()
-            )
 
-            # prompt_tokens: [N, 1, 256]
-            # SAM prompt_encoder 会把它拼进 sparse prompt embeddings。
+            if self.use_dia:
+                evidence_tokens, attn_maps = self.model.context_adapter(
+                    con_embeddings=con_i,
+                    image_embeddings=image_i,
+                    image_pe=image_pe,
+                )
+                if getattr(self, "dia_bypass_fusion", False):
+                    prompt_tokens = seg_i.unsqueeze(1)
+                    gate_mean = None
+                else:
+                    prompt_tokens = self.model.evidence_fusion(
+                        seg_embeddings=seg_i,
+                        con_embeddings=con_i,
+                        evidence_tokens=evidence_tokens,
+                    )
+                    gate_mean = getattr(self.model.evidence_fusion, "last_gate_mean", None)
+
+                if gate_mean is not None:
+                    debug_stats["gate_means"].append(gate_mean)
+                flat_attn = attn_maps.detach().flatten(-2).clamp_min(1e-8)
+                debug_stats["attention_entropies"].append(
+                    -(flat_attn * flat_attn.log()).sum(dim=-1).mean()
+                )
+            else:
+                prompt_tokens = seg_i.unsqueeze(1)
+                attn_maps = None
+
             sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
                 points=None,
                 boxes=None,
@@ -607,19 +631,29 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             token_idx=self.seg_token_idx,
             hidden_len=hidden_len,
         )
-        prompt_token_mask = self.build_dia_prompt_token_mask(
-            input_ids=input_ids,
-            seg_token_mask=seg_token_mask,
-            hidden_len=hidden_len,
-        )
-        # DIA ? [CON] [SEG] ???????? prompt ?????? [CON]?? hidden state?
-        # ?? projector ???????????? res_scale=0 ?????? LISAt?
+        if self.use_dia:
+            prompt_token_mask = self.build_dia_prompt_token_mask(
+                input_ids=input_ids,
+                seg_token_mask=seg_token_mask,
+                hidden_len=hidden_len,
+            )
+        else:
+            prompt_token_mask = seg_token_mask
+
         prompt_hidden = last_hidden_state
         seg_flat = self.model.text_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
-        con_flat = self.model.con_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
-        # ? conversation-level ????? image-level?
         seg_embeddings = self.split_embeddings_by_offset(seg_flat, prompt_token_mask, offset)
-        con_embeddings = self.split_embeddings_by_offset(con_flat, prompt_token_mask, offset)
+        if self.use_dia:
+            # DIA uses the same prompt hidden state for both projectors in this
+            # compatibility version: dia_con_source=seg_hidden_dual_projector.
+            con_flat = self.model.con_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
+            con_embeddings = self.split_embeddings_by_offset(
+                con_flat,
+                prompt_token_mask,
+                offset,
+            )
+        else:
+            con_embeddings = None
 
 
         image_embeddings = self.get_visual_embs(images)
@@ -651,7 +685,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             ce_loss = output_logits.sum() * 0.0
 
         has_positive_masks = any(int(gt_mask.shape[0]) > 0 for gt_mask in gt_masks)
-        uses_con_projector = any(
+        uses_con_projector = self.use_dia and any(
             con_i is not None and con_i.shape[0] > 0
             for con_i in con_embeddings
         )
@@ -663,14 +697,14 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             attn_maps_list=attn_maps_list,
             bce_loss_weight=self.bce_loss_weight,
             dice_loss_weight=self.dice_loss_weight,
-            attn_loss_weight=self.attn_loss_weight,
+            attn_loss_weight=self.attn_loss_weight if self.use_dia else 0.0,
         )
 
         if not has_positive_masks:
             loss_dict["loss"] = loss_dict["loss"] + self.segmentation_zero_anchor(
                 loss_dict["loss"]
             )
-        elif not uses_con_projector:
+        elif self.use_dia and not uses_con_projector:
             loss_dict["loss"] = loss_dict["loss"] + self.con_projector_zero_anchor(
                 loss_dict["loss"]
             )
@@ -683,7 +717,10 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             attention_entropy = torch.stack(dia_debug_stats["attention_entropies"]).mean()
         else:
             attention_entropy = ce_loss.new_zeros(())
-        res_scale = torch.tanh(self.model.evidence_fusion.res_scale.detach()).to(ce_loss.device)
+        if self.use_dia:
+            res_scale = torch.tanh(self.model.evidence_fusion.res_scale.detach()).to(ce_loss.device)
+        else:
+            res_scale = ce_loss.new_zeros(())
 
         loss_dict["ce_loss"] = ce_loss
         loss_dict["res_scale"] = res_scale
@@ -763,11 +800,14 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 hidden_len=hidden_len,
             )
 
-            prompt_token_mask = self.build_dia_prompt_token_mask(
-                input_ids=output_ids,
-                seg_token_mask=seg_token_mask,
-                hidden_len=hidden_len,
-            )
+            if self.use_dia:
+                prompt_token_mask = self.build_dia_prompt_token_mask(
+                    input_ids=output_ids,
+                    seg_token_mask=seg_token_mask,
+                    hidden_len=hidden_len,
+                )
+            else:
+                prompt_token_mask = seg_token_mask
 
             seg_token_counts = seg_token_mask.int().sum(-1)
             object_presence = [count.item() > 0 for count in seg_token_counts]
@@ -775,7 +815,6 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             # evaluate() ????????????? prompt ???
             prompt_hidden = last_hidden_state
             seg_flat = self.model.text_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
-            con_flat = self.model.con_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
 
             # evaluate() receives one generated conversation per image/question,
             # so each row is its own image-level group.
@@ -786,7 +825,15 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             )
 
             seg_embeddings = self.split_embeddings_by_offset(seg_flat, prompt_token_mask, offset)
-            con_embeddings = self.split_embeddings_by_offset(con_flat, prompt_token_mask, offset)
+            if self.use_dia:
+                con_flat = self.model.con_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
+                con_embeddings = self.split_embeddings_by_offset(
+                    con_flat,
+                    prompt_token_mask,
+                    offset,
+                )
+            else:
+                con_embeddings = None
 
 
             image_embeddings = self.get_visual_embs(images)
@@ -826,19 +873,28 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
 def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **kwargs):
     kwargs["device_map"] = device_map
+    use_dia = kwargs.pop("use_dia", False)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
-    tokenizer.add_tokens(["[SEG]", "[CON]"])
+    lisat_tokens = ["[SEG]"]
+    if use_dia:
+        lisat_tokens.append("[CON]")
+    tokenizer.add_tokens(lisat_tokens)
 
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
-    con_token_idx = tokenizer("[CON]", add_special_tokens=False).input_ids[0]
+    con_token_idx = (
+        tokenizer("[CON]", add_special_tokens=False).input_ids[0]
+        if use_dia
+        else None
+    )
 
     model = LISATForCausalLM.from_pretrained(
         model_path, 
         low_cpu_mem_usage=True, 
         seg_token_idx=seg_token_idx,
-        con_token_idx=con_token_idx, 
+        con_token_idx=con_token_idx,
+        use_dia=use_dia,
         **kwargs
     )
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -917,16 +973,27 @@ def init_LISAT_model(args, model_args):
         legacy=True,
     )
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_tokens = tokenizer.add_tokens(["[SEG]", "[CON]"])
+    tokenizer_size_before = len(tokenizer)
+    lisat_tokens = ["[SEG]"]
+    if args.use_dia:
+        lisat_tokens.append("[CON]")
+    tokenizer.add_tokens(lisat_tokens)
+    tokenizer_size_after_lisat_tokens = len(tokenizer)
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
-    args.con_token_idx = tokenizer("[CON]", add_special_tokens=False).input_ids[0]
+    args.con_token_idx = (
+        tokenizer("[CON]", add_special_tokens=False).input_ids[0]
+        if args.use_dia
+        else None
+    )
     model_args["seg_token_idx"] = args.seg_token_idx
     model_args["con_token_idx"] = args.con_token_idx
+    model_args["use_dia"] = args.use_dia
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
             [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
         )
+    tokenizer_size_after = len(tokenizer)
 
     torch_dtype = torch.float32
     if args.precision == "bf16":
@@ -943,21 +1010,29 @@ def init_LISAT_model(args, model_args):
     config.mm_use_im_start_end = args.use_mm_start_end
     config.mm_vision_tower = args.vision_tower
     config.vision_tower = args.vision_tower
+    config.use_dia = args.use_dia
     config.dia_num_evidence_tokens = args.dia_num_evidence_tokens
     config.dia_num_heads = args.dia_num_heads
     config.dia_attn_dropout = args.dia_attn_dropout
     config.fusion_dropout = args.fusion_dropout
-    config.attn_loss_weight = args.attn_loss_weight
+    config.attn_loss_weight = args.attn_loss_weight if args.use_dia else 0.0
+    config.dia_bypass_fusion = getattr(args, "dia_bypass_fusion", False)
 
-    model = LISATForCausalLM.from_pretrained(
+    pretrained_output = LISATForCausalLM.from_pretrained(
         args.version,
         config=config,
         torch_dtype=torch_dtype,
         # DIA adds a scalar ReZero parameter. Transformers' meta-device loader
         # can fail on 0-d parameters, so use the regular loader here.
         low_cpu_mem_usage=False,
+        output_loading_info=True,
         **model_args
     )
+    if isinstance(pretrained_output, tuple):
+        model, loading_info = pretrained_output
+    else:
+        model = pretrained_output
+        loading_info = {}
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -965,20 +1040,36 @@ def init_LISAT_model(args, model_args):
     if "lisat_pre" in args.version.lower():
         if getattr(args, "local_rank", 0) == 0:
             print(
-                "[LISAT_PRE] Rebuilding SAM, prompt projectors, and DIA "
-                "modules after from_pretrained so post_init cannot leave "
-                "the segmentation branch randomly initialized."
+                "[LISAT_PRE] Loaded base checkpoint without post-load "
+                "initialize_lisat_modules(); stage-2 heads are the constructor "
+                "instances and will not be overwritten after from_pretrained."
             )
-        model.get_model().initialize_lisat_modules(model.get_model().config)
 
     model.resize_token_embeddings(len(tokenizer))
-    if getattr(args, "init_con_from_seg", True):
+    if args.use_dia and getattr(args, "init_con_from_seg", True):
         _copy_con_from_seg_initialization(
             model,
             args.seg_token_idx,
             args.con_token_idx,
         )
-    _validate_dia_structure(model)
+    if args.use_dia:
+        _validate_dia_structure(model)
+    if getattr(args, "local_rank", 0) == 0:
+        missing_keys = loading_info.get("missing_keys", [])
+        unexpected_keys = loading_info.get("unexpected_keys", [])
+        print(
+            "[Tokenizer] "
+            f"size_before={tokenizer_size_before}, "
+            f"size_after_lisat_tokens={tokenizer_size_after_lisat_tokens}, "
+            f"size_after={tokenizer_size_after}, "
+            f"seg_token_idx={args.seg_token_idx}, "
+            f"con_token_idx={args.con_token_idx}"
+        )
+        print(
+            "[LoadInfo] "
+            f"missing_keys={len(missing_keys)}, "
+            f"unexpected_keys={len(unexpected_keys)}"
+        )
 
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
@@ -997,7 +1088,9 @@ def init_LISAT_model(args, model_args):
         def find_linear_layers(model, lora_target_modules):
             cls = torch.nn.Linear
             lora_module_names = set()
-            exclude_list = ["visual_model", "vision_tower", "mm_projector", "text_hidden_fcs", "con_hidden_fcs", "context_adapter", "evidence_fusion"]
+            exclude_list = ["visual_model", "vision_tower", "mm_projector", "text_hidden_fcs"]
+            if args.use_dia:
+                exclude_list.extend(["con_hidden_fcs", "context_adapter", "evidence_fusion"])
             for name, module in model.named_modules():
                 if isinstance(module, cls) and not any(x in name for x in exclude_list) \
                    and any([x in name for x in lora_target_modules]):
@@ -1019,9 +1112,28 @@ def init_LISAT_model(args, model_args):
         model.print_trainable_parameters()
 
     # Make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
-    trainable_parts = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "con_hidden_fcs", "context_adapter", "evidence_fusion",]
+    trainable_parts = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+    if args.use_dia:
+        trainable_parts.extend(["con_hidden_fcs", "context_adapter", "evidence_fusion"])
     for n, p in model.named_parameters():
         if any(part in n for part in trainable_parts):
             p.requires_grad = True
+
+    if getattr(args, "local_rank", 0) == 0:
+        dia_parts = ("con_hidden_fcs", "context_adapter", "evidence_fusion")
+        core_trainable_params = 0
+        dia_trainable_params = 0
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(part in name for part in dia_parts):
+                dia_trainable_params += param.numel()
+            else:
+                core_trainable_params += param.numel()
+        print(
+            "[Trainable] "
+            f"core_trainable_params={core_trainable_params}, "
+            f"dia_trainable_params={dia_trainable_params}"
+        )
 
     return tokenizer, model, vision_tower

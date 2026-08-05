@@ -55,6 +55,33 @@ def test_context_adapter_k1_attention_sums_to_one():
     assert torch.allclose(spatial_sum, torch.ones_like(spatial_sum), atol=1e-5)
 
 
+def test_dia_adapter_fusion_forward_backward_smoke():
+    torch.manual_seed(3)
+    adapter = ContextEvidenceAdapter(
+        dim=8,
+        num_heads=2,
+        num_evidence_tokens=1,
+        dropout=0.0,
+    )
+    fusion = EvidenceGuideFusion(dim=8, dropout=0.0)
+
+    con = torch.randn(2, 8, requires_grad=True)
+    seg = torch.randn(2, 8, requires_grad=True)
+    image_embeddings = torch.randn(1, 8, 4, 4, requires_grad=True)
+    image_pe = torch.randn(1, 8, 4, 4)
+
+    evidence, attn_maps = adapter(con, image_embeddings, image_pe=image_pe)
+    fused = fusion(seg, con, evidence)
+    loss = fused.square().mean() + attn_maps.square().mean()
+    loss.backward()
+
+    assert fused.shape == (2, 1, 8)
+    assert torch.isfinite(con.grad).all()
+    assert torch.isfinite(seg.grad).all()
+    assert torch.isfinite(image_embeddings.grad).all()
+    assert fusion.res_scale.grad is not None
+
+
 def test_attention_alignment_loss_area_kl_cases():
     gt = torch.zeros(1, 8, 8)
     gt[:, 1:3, 1:3] = 1.0
@@ -212,6 +239,8 @@ def test_auto_resume_argparse_defaults():
     assert parse_args(["--auto_resume"]).auto_resume is True
     assert parse_args(["--no_auto_resume"]).auto_resume is False
     args = parse_args([])
+    assert args.use_dia is False
+    assert parse_args(["--use_dia"]).use_dia is True
     assert args.dia_num_evidence_tokens == 1
     assert args.dia_num_heads == 8
     assert args.dia_attn_dropout == 0.0
@@ -221,6 +250,7 @@ def test_auto_resume_argparse_defaults():
 if __name__ == "__main__":
     test_fusion_zero_init_matches_original_seg()
     test_context_adapter_k1_attention_sums_to_one()
+    test_dia_adapter_fusion_forward_backward_smoke()
     test_attention_alignment_loss_area_kl_cases()
     test_all_negative_loss_backward_is_ce_only()
     test_mixed_positive_negative_loss_backward_is_finite()
