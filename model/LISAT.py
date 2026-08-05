@@ -197,6 +197,7 @@ class LisatMetaModel(nn.Module):
             )
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
+        self._mark_lisat_modules_hf_initialized()
         self.lisat_modules_initialized = True
 
     @property
@@ -204,6 +205,27 @@ class LisatMetaModel(nn.Module):
         if not self.use_dia:
             raise AttributeError("DIA evidence adapter is disabled because use_dia=False.")
         return self.context_adapter
+
+    def _mark_lisat_modules_hf_initialized(self):
+        """Protect missing LISAt modules from Transformers re-initialization.
+
+        LISAt_PRE does not contain SAM, [SEG] projector, or DIA weights. During
+        from_pretrained(), Transformers initializes missing modules unless they
+        are marked as already initialized. These modules are intentionally built
+        by LISAt/SAM code, so they must be skipped by HF's generic initializer.
+        """
+        modules = [self.visual_model, self.text_hidden_fcs]
+        if self.use_dia:
+            modules.extend(
+                [
+                    self.con_hidden_fcs,
+                    self.context_adapter,
+                    self.evidence_fusion,
+                ]
+            )
+        for module in modules:
+            for submodule in module.modules():
+                submodule._is_hf_initialized = True
 
 
 class LisatModel(LisatMetaModel, LlavaLlamaModel):

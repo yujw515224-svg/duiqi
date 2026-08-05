@@ -440,6 +440,12 @@ def parse_args(args):
         default="val_giou",
         help="Metric used to choose the best epoch checkpoint.",
     )
+    parser.add_argument(
+        "--min_best_score_to_save",
+        type=float,
+        default=1e-8,
+        help="Skip checkpoint saving until the selected best metric is positive.",
+    )
     parser.add_argument("--save_visualizations", action="store_true", default=True, help="Save GT/prediction mask visualizations during validation.")
     parser.add_argument("--vis_samples", type=int, default=16, help="Maximum visualizations saved per validation call.")
     parser.add_argument("--vis_dir", default="", help="Optional visualization output directory. Defaults to log_dir/visualizations.")
@@ -931,6 +937,7 @@ def main(args):
                 combined_metric = seg_metrics[args.best_metric]
 
             is_best = combined_metric > best_score
+            should_save_best = is_best and combined_metric > args.min_best_score_to_save
             best_score = max(best_score, combined_metric)
             if is_best:
                 best_epoch = epoch
@@ -947,7 +954,7 @@ def main(args):
                 "best_score": best_score,
                 "best_epoch": best_epoch,
                 "is_best": is_best,
-                "checkpoint_dir": os.path.join(args.log_dir, "best_ckpt_model") if is_best else "",
+                "checkpoint_dir": os.path.join(args.log_dir, "best_ckpt_model") if should_save_best else "",
             }
             metrics_record.update(seg_metrics)
             append_metrics(
@@ -958,13 +965,19 @@ def main(args):
             if args.local_rank == 0:
                 wandb.log({"best_score": best_score}, step=global_iters)
 
-            if is_best:
+            if should_save_best:
                 save_best_checkpoint(
                     model_engine,
                     args,
                     epoch,
                     global_iters,
                     metrics_record,
+                )
+            elif is_best and args.local_rank == 0:
+                print(
+                    "[Best] metric improved but checkpoint save skipped because "
+                    f"{args.best_metric}={combined_metric:.6g} <= "
+                    f"min_best_score_to_save={args.min_best_score_to_save}."
                 )
 
     if args.no_eval:
