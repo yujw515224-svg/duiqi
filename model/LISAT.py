@@ -252,6 +252,13 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
         self.use_dia = kwargs.pop("use_dia", getattr(config, "use_dia", False))
         config.use_dia = self.use_dia
+        self.explicit_con_in_conversation = kwargs.pop(
+            "explicit_con_in_conversation",
+            getattr(config, "explicit_con_in_conversation", False),
+        )
+        if not self.use_dia:
+            self.explicit_con_in_conversation = False
+        config.explicit_con_in_conversation = self.explicit_con_in_conversation
         self.con_token_idx = kwargs.pop("con_token_idx", None)
         self.dia_bypass_fusion = kwargs.pop(
             "dia_bypass_fusion",
@@ -451,6 +458,58 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             prompt_token_mask[missing_pair] = seg_token_mask[missing_pair]
         return prompt_token_mask
 
+    def validate_explicit_con_seg_pairs(self, input_ids):
+        """Check raw token IDs before hidden-state shifting."""
+        if self.con_token_idx is None:
+            raise RuntimeError("Explicit DIA requires a valid [CON] token id.")
+
+        for row_idx, row in enumerate(input_ids):
+            con_pos = (row == self.con_token_idx).nonzero(as_tuple=False).flatten()
+            seg_pos = (row == self.seg_token_idx).nonzero(as_tuple=False).flatten()
+
+            if con_pos.numel() != seg_pos.numel():
+                raise RuntimeError(
+                    "Explicit DIA requires equal [CON]/[SEG] counts, "
+                    f"row={row_idx}, con={con_pos.numel()}, seg={seg_pos.numel()}."
+                )
+            if con_pos.numel() == 0:
+                continue
+            if not torch.equal(seg_pos, con_pos + 1):
+                raise RuntimeError(
+                    "Explicit DIA requires every [SEG] to immediately follow [CON], "
+                    f"row={row_idx}, con_pos={con_pos.tolist()}, seg_pos={seg_pos.tolist()}."
+                )
+
+    def build_dia_token_masks(self, input_ids, hidden_len):
+        """Return separate hidden-state masks for explicit [SEG] and [CON] tokens."""
+        seg_token_mask = self.build_shifted_token_mask(
+            input_ids=input_ids,
+            token_idx=self.seg_token_idx,
+            hidden_len=hidden_len,
+        )
+        if not self.use_dia or not self.explicit_con_in_conversation:
+            return seg_token_mask, seg_token_mask
+
+        self.validate_explicit_con_seg_pairs(input_ids)
+        con_token_mask = self.build_shifted_token_mask(
+            input_ids=input_ids,
+            token_idx=self.con_token_idx,
+            hidden_len=hidden_len,
+        )
+
+        seg_counts = seg_token_mask.int().sum(-1)
+        con_counts = con_token_mask.int().sum(-1)
+        if not torch.equal(seg_counts, con_counts):
+            raise RuntimeError(
+                "Explicit DIA shifted mask counts differ: "
+                f"con={con_counts.tolist()}, seg={seg_counts.tolist()}."
+            )
+        if int(seg_token_mask.sum().item()) > 0 and torch.equal(seg_token_mask, con_token_mask):
+            raise RuntimeError(
+                "Explicit DIA [CON] and [SEG] masks are identical; expected adjacent hidden states."
+            )
+        return seg_token_mask, con_token_mask
+
     
     def split_embeddings_by_offset(self, flat_embeddings, token_mask, offset):
         """
@@ -510,15 +569,22 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 continue
 
             if self.use_dia:
-                # Reuse one concept query for multiple prompts from the same image.
-                if con_i.shape[0] == 1 and seg_i.shape[0] > 1:
-                    con_i = con_i.expand(seg_i.shape[0], -1)
-                # Generated answers can still contain [SEG] without [CON]. Keep
-                # inference robust, but do not inject [CON] into the dataset.
-                if con_i.shape[0] == 0:
-                    con_i = seg_i
-
-                num_prompts = min(seg_i.shape[0], con_i.shape[0])
+                if con_i is None:
+                    raise RuntimeError("DIA mask decoding requires concept embeddings.")
+                if self.explicit_con_in_conversation:
+                    if con_i.shape[0] != seg_i.shape[0]:
+                        raise RuntimeError(
+                            "Explicit DIA requires one [CON] embedding for every [SEG] prompt, "
+                            f"image={i}, con={con_i.shape[0]}, seg={seg_i.shape[0]}."
+                        )
+                    num_prompts = seg_i.shape[0]
+                else:
+                    # Structural DIA compatibility: old data can contain only [SEG].
+                    if con_i.shape[0] == 1 and seg_i.shape[0] > 1:
+                        con_i = con_i.expand(seg_i.shape[0], -1)
+                    if con_i.shape[0] == 0:
+                        con_i = seg_i
+                    num_prompts = min(seg_i.shape[0], con_i.shape[0])
                 seg_i = seg_i[:num_prompts]
                 con_i = con_i[:num_prompts]
             else:
@@ -657,33 +723,37 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         )
         hidden_len = last_hidden_state.shape[1]
 
-        seg_token_mask = self.build_shifted_token_mask(
-            input_ids=input_ids,
-            token_idx=self.seg_token_idx,
-            hidden_len=hidden_len,
-        )
         if self.use_dia:
-            prompt_token_mask = self.build_dia_prompt_token_mask(
+            seg_token_mask, con_token_mask = self.build_dia_token_masks(
                 input_ids=input_ids,
-                seg_token_mask=seg_token_mask,
                 hidden_len=hidden_len,
             )
         else:
-            prompt_token_mask = seg_token_mask
+            seg_token_mask = self.build_shifted_token_mask(
+                input_ids=input_ids,
+                token_idx=self.seg_token_idx,
+                hidden_len=hidden_len,
+            )
+            con_token_mask = None
 
-        prompt_hidden = last_hidden_state
-        seg_flat = self.model.text_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
-        seg_embeddings = self.split_embeddings_by_offset(seg_flat, prompt_token_mask, offset)
+        seg_hidden = last_hidden_state[seg_token_mask]
+        seg_flat = self.model.text_hidden_fcs[0](seg_hidden)
+        seg_embeddings = self.split_embeddings_by_offset(seg_flat, seg_token_mask, offset)
         if self.use_dia:
-            # DIA uses the same prompt hidden state for both projectors in this
-            # compatibility version: dia_con_source=seg_hidden_dual_projector.
-            con_flat = self.model.con_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
+            con_hidden = last_hidden_state[con_token_mask]
+            if con_hidden.shape[0] != seg_hidden.shape[0]:
+                raise RuntimeError(
+                    "DIA prompt/concept hidden counts differ before projection: "
+                    f"con={con_hidden.shape[0]}, seg={seg_hidden.shape[0]}."
+                )
+            con_flat = self.model.con_hidden_fcs[0](con_hidden)
             con_embeddings = self.split_embeddings_by_offset(
                 con_flat,
-                prompt_token_mask,
+                con_token_mask,
                 offset,
             )
         else:
+            con_hidden = None
             con_embeddings = None
 
 
@@ -753,10 +823,41 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         else:
             res_scale = ce_loss.new_zeros(())
 
+        explicit_con_count = ce_loss.new_zeros(())
+        explicit_seg_count = ce_loss.new_zeros(())
+        explicit_pair_rate = ce_loss.new_zeros(())
+        explicit_hidden_cosine = ce_loss.new_zeros(())
+        if self.use_dia:
+            explicit_con_count = con_token_mask.sum().to(
+                device=ce_loss.device,
+                dtype=ce_loss.dtype,
+            )
+            explicit_seg_count = seg_token_mask.sum().to(
+                device=ce_loss.device,
+                dtype=ce_loss.dtype,
+            )
+            if self.explicit_con_in_conversation:
+                # Reaching this point means raw tokens and shifted masks passed validation.
+                explicit_pair_rate = ce_loss.new_ones(())
+            if (
+                con_hidden is not None
+                and con_hidden.shape[0] > 0
+                and con_hidden.shape == seg_hidden.shape
+            ):
+                explicit_hidden_cosine = F.cosine_similarity(
+                    con_hidden.detach().float(),
+                    seg_hidden.detach().float(),
+                    dim=-1,
+                ).mean().to(device=ce_loss.device, dtype=ce_loss.dtype)
+
         loss_dict["ce_loss"] = ce_loss
         loss_dict["res_scale"] = res_scale
         loss_dict["gate_mean"] = gate_mean.detach()
         loss_dict["attention_entropy"] = attention_entropy.detach()
+        loss_dict["explicit_con_count"] = explicit_con_count.detach()
+        loss_dict["explicit_seg_count"] = explicit_seg_count.detach()
+        loss_dict["explicit_pair_rate"] = explicit_pair_rate.detach()
+        loss_dict["explicit_hidden_cosine"] = explicit_hidden_cosine.detach()
         return loss_dict
 
     #
@@ -825,27 +926,37 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             )
             hidden_len = last_hidden_state.shape[1]
 
-            seg_token_mask = self.build_shifted_token_mask(
-                input_ids=output_ids,
-                token_idx=self.seg_token_idx,
-                hidden_len=hidden_len,
-            )
-
-            if self.use_dia:
-                prompt_token_mask = self.build_dia_prompt_token_mask(
-                    input_ids=output_ids,
-                    seg_token_mask=seg_token_mask,
-                    hidden_len=hidden_len,
-                )
-            else:
-                prompt_token_mask = seg_token_mask
+            try:
+                if self.use_dia:
+                    seg_token_mask, con_token_mask = self.build_dia_token_masks(
+                        input_ids=output_ids,
+                        hidden_len=hidden_len,
+                    )
+                else:
+                    seg_token_mask = self.build_shifted_token_mask(
+                        input_ids=output_ids,
+                        token_idx=self.seg_token_idx,
+                        hidden_len=hidden_len,
+                    )
+                    con_token_mask = None
+            except RuntimeError:
+                if not (self.use_dia and self.explicit_con_in_conversation):
+                    raise
+                output_pred_masks = []
+                object_presence = [False for _ in sam_mask_shape_list]
+                for _, original_size in sam_mask_shape_list:
+                    original_size = (int(original_size[0]), int(original_size[1]))
+                    output_pred_masks.append(
+                        torch.zeros(
+                            original_size,
+                            dtype=torch.int,
+                            device=images.device,
+                        )
+                    )
+                return output_ids, output_pred_masks, object_presence
 
             seg_token_counts = seg_token_mask.int().sum(-1)
             object_presence = [count.item() > 0 for count in seg_token_counts]
-
-            # evaluate() ????????????? prompt ???
-            prompt_hidden = last_hidden_state
-            seg_flat = self.model.text_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
 
             # evaluate() receives one generated conversation per image/question,
             # so each row is its own image-level group.
@@ -855,12 +966,33 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 device=output_ids.device,
             )
 
-            seg_embeddings = self.split_embeddings_by_offset(seg_flat, prompt_token_mask, offset)
+            seg_hidden = last_hidden_state[seg_token_mask]
+            seg_flat = self.model.text_hidden_fcs[0](seg_hidden)
+            seg_embeddings = self.split_embeddings_by_offset(seg_flat, seg_token_mask, offset)
             if self.use_dia:
-                con_flat = self.model.con_hidden_fcs[0](prompt_hidden)[prompt_token_mask]
+                con_hidden = last_hidden_state[con_token_mask]
+                if con_hidden.shape[0] != seg_hidden.shape[0]:
+                    if self.explicit_con_in_conversation:
+                        output_pred_masks = []
+                        object_presence = [False for _ in sam_mask_shape_list]
+                        for _, original_size in sam_mask_shape_list:
+                            original_size = (int(original_size[0]), int(original_size[1]))
+                            output_pred_masks.append(
+                                torch.zeros(
+                                    original_size,
+                                    dtype=torch.int,
+                                    device=images.device,
+                                )
+                            )
+                        return output_ids, output_pred_masks, object_presence
+                    raise RuntimeError(
+                        "DIA evaluate hidden counts differ: "
+                        f"con={con_hidden.shape[0]}, seg={seg_hidden.shape[0]}."
+                    )
+                con_flat = self.model.con_hidden_fcs[0](con_hidden)
                 con_embeddings = self.split_embeddings_by_offset(
                     con_flat,
-                    prompt_token_mask,
+                    con_token_mask,
                     offset,
                 )
             else:
@@ -905,6 +1037,9 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **kwargs):
     kwargs["device_map"] = device_map
     use_dia = kwargs.pop("use_dia", False)
+    explicit_con_in_conversation = kwargs.pop("explicit_con_in_conversation", False)
+    if explicit_con_in_conversation and not use_dia:
+        raise RuntimeError("explicit_con_in_conversation requires use_dia=True.")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
@@ -926,6 +1061,7 @@ def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **
         seg_token_idx=seg_token_idx,
         con_token_idx=con_token_idx,
         use_dia=use_dia,
+        explicit_con_in_conversation=explicit_con_in_conversation,
         **kwargs
     )
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -995,6 +1131,21 @@ def _validate_dia_structure(model):
     assert base_model.evidence_fusion.res_scale.detach().item() == 0.0
 
 
+def _validate_explicit_tokenizer_pair(tokenizer):
+    con_ids = tokenizer("[CON]", add_special_tokens=False).input_ids
+    seg_ids = tokenizer("[SEG]", add_special_tokens=False).input_ids
+    pair_ids = tokenizer("[CON][SEG]", add_special_tokens=False).input_ids
+    if len(con_ids) != 1 or len(seg_ids) != 1:
+        raise RuntimeError(
+            f"[CON]/[SEG] must be single tokens, got con={con_ids}, seg={seg_ids}."
+        )
+    if pair_ids != [con_ids[0], seg_ids[0]]:
+        raise RuntimeError(
+            f"[CON][SEG] must tokenize as adjacent pair, got {pair_ids}."
+        )
+    return con_ids[0], seg_ids[0], pair_ids
+
+
 def init_LISAT_model(args, model_args):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
@@ -1005,6 +1156,8 @@ def init_LISAT_model(args, model_args):
     )
     tokenizer.pad_token = tokenizer.unk_token
     tokenizer_size_before = len(tokenizer)
+    if getattr(args, "explicit_con_in_conversation", False) and not args.use_dia:
+        raise RuntimeError("explicit_con_in_conversation requires use_dia=True.")
     lisat_tokens = ["[SEG]"]
     if args.use_dia:
         lisat_tokens.append("[CON]")
@@ -1019,6 +1172,15 @@ def init_LISAT_model(args, model_args):
     model_args["seg_token_idx"] = args.seg_token_idx
     model_args["con_token_idx"] = args.con_token_idx
     model_args["use_dia"] = args.use_dia
+    model_args["explicit_con_in_conversation"] = getattr(
+        args,
+        "explicit_con_in_conversation",
+        False,
+    )
+
+    explicit_pair_ids = None
+    if getattr(args, "explicit_con_in_conversation", False):
+        _, _, explicit_pair_ids = _validate_explicit_tokenizer_pair(tokenizer)
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
@@ -1042,6 +1204,11 @@ def init_LISAT_model(args, model_args):
     config.mm_vision_tower = args.vision_tower
     config.vision_tower = args.vision_tower
     config.use_dia = args.use_dia
+    config.explicit_con_in_conversation = getattr(
+        args,
+        "explicit_con_in_conversation",
+        False,
+    )
     config.dia_num_evidence_tokens = args.dia_num_evidence_tokens
     config.dia_num_heads = args.dia_num_heads
     config.dia_attn_dropout = args.dia_attn_dropout
@@ -1096,6 +1263,11 @@ def init_LISAT_model(args, model_args):
             f"seg_token_idx={args.seg_token_idx}, "
             f"con_token_idx={args.con_token_idx}"
         )
+        if explicit_pair_ids is not None:
+            print(
+                "[Tokenizer] "
+                f"explicit_pair=[CON][SEG], token_ids={explicit_pair_ids}"
+            )
         print(
             "[LoadInfo] "
             f"missing_keys={len(missing_keys)}, "

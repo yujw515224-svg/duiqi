@@ -74,6 +74,10 @@ METRIC_FIELDS = [
     "res_scale",
     "gate_mean",
     "attention_entropy",
+    "explicit_con_count",
+    "explicit_seg_count",
+    "explicit_pair_rate",
+    "explicit_hidden_cosine",
     "lr",
     "val_giou",
     "val_ciou",
@@ -513,6 +517,12 @@ def parse_args(args):
         default=False,
         help="Enable DIA-LISAt modules. Default False keeps the original LISAt path.",
     )
+    parser.add_argument(
+        "--explicit_con_in_conversation",
+        action="store_true",
+        default=False,
+        help="Train explicit DIA answers as adjacent [CON][SEG] token pairs.",
+    )
     parser.add_argument("--attn_loss_weight", type=float, default=0.02)
     parser.add_argument("--dia_num_heads", type=int, default=8)
     parser.add_argument("--dia_num_evidence_tokens", type=int, default=1)
@@ -540,6 +550,10 @@ def parse_args(args):
 
 def main(args):
     args = parse_args(args)
+    if args.explicit_con_in_conversation and not args.use_dia:
+        raise ValueError("--explicit_con_in_conversation requires --use_dia.")
+    if args.explicit_con_in_conversation and not args.init_con_from_seg:
+        raise ValueError("--explicit_con_in_conversation requires --init_con_from_seg.")
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
 
     if args.local_rank == 0:
@@ -552,11 +566,18 @@ def main(args):
             f"manual_resume={args.resume or None}, "
             f"auto_resume={args.auto_resume}"
         )
+        dia_con_source = None
+        if args.use_dia:
+            dia_con_source = (
+                "explicit_con_seg_dual_hidden"
+                if args.explicit_con_in_conversation
+                else "seg_hidden_dual_projector"
+            )
         print(
             "[Mode] "
             f"use_dia={args.use_dia}, "
-            f"dia_con_source={'seg_hidden_dual_projector' if args.use_dia else None}, "
-            "explicit_con_in_conversation=False"
+            f"dia_con_source={dia_con_source}, "
+            f"explicit_con_in_conversation={args.explicit_con_in_conversation}"
         )
         print(
             "[DIA] "
@@ -589,6 +610,7 @@ def main(args):
         "dia_attn_dropout": args.dia_attn_dropout,
         "fusion_dropout": args.fusion_dropout,
         "dia_bypass_fusion": args.dia_bypass_fusion,
+        "explicit_con_in_conversation": args.explicit_con_in_conversation,
 
     }
     tokenizer, model, vision_tower = init_LISAT_model(args, model_args)
@@ -715,6 +737,7 @@ def main(args):
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
+            explicit_con_in_conversation=args.explicit_con_in_conversation,
         ),
         config=ds_config,
     )
@@ -759,6 +782,7 @@ def main(args):
                 collate_fn_val,
                 tokenizer=tokenizer,
                 use_mm_start_end=args.use_mm_start_end,
+                explicit_con_in_conversation=args.explicit_con_in_conversation,
             ),
         )
 
@@ -1002,6 +1026,10 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
         "res_scale",
         "gate_mean",
         "attention_entropy",
+        "explicit_con_count",
+        "explicit_seg_count",
+        "explicit_pair_rate",
+        "explicit_hidden_cosine",
     ]
     loss_meters = {k: AverageMeter(k, ":.4f") for k in keys}
 

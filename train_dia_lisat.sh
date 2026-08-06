@@ -32,7 +32,9 @@ GEO_REASON_SEG_DATA="${GEO_REASON_SEG_DATA:-GeoReasonSeg|train}"
 
 EVAL_DATASET="${EVAL_DATASET:-geo_reason_seg}"
 EVAL_SPLIT="${EVAL_SPLIT:-val}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-0}"
 BEST_METRIC="${BEST_METRIC:-val_giou}"
+MIN_BEST_SCORE_TO_SAVE="${MIN_BEST_SCORE_TO_SAVE:-1e-8}"
 
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUMULATION_STEPS="${GRAD_ACCUMULATION_STEPS:-4}"
@@ -45,6 +47,7 @@ ZERO_STAGE="${ZERO_STAGE:-2}"
 ZERO_BUCKET_SIZE="${ZERO_BUCKET_SIZE:-5e7}"
 WORKERS="${WORKERS:-4}"
 VIS_SAMPLES="${VIS_SAMPLES:-16}"
+PRINT_FREQ="${PRINT_FREQ:-10}"
 
 DIA_NUM_EVIDENCE_TOKENS="${DIA_NUM_EVIDENCE_TOKENS:-1}"
 DIA_NUM_HEADS="${DIA_NUM_HEADS:-8}"
@@ -53,6 +56,7 @@ FUSION_DROPOUT="${FUSION_DROPOUT:-0.0}"
 ATTN_LOSS_WEIGHT="${ATTN_LOSS_WEIGHT:-0.02}"
 DIA_BYPASS_FUSION="${DIA_BYPASS_FUSION:-0}"
 USE_DIA="${USE_DIA:-1}"
+EXPLICIT_CON="${EXPLICIT_CON:-1}"
 
 RUN_BACKGROUND="${RUN_BACKGROUND:-0}"
 LOG_FILE="${LOG_FILE:-${LOG_BASE_DIR}/${EXP_NAME}_train.log}"
@@ -78,7 +82,9 @@ ARGS=(
   --geo_reason_seg_data "$GEO_REASON_SEG_DATA"
   --eval_dataset "$EVAL_DATASET"
   --eval_split "$EVAL_SPLIT"
+  --eval_samples "$EVAL_SAMPLES"
   --best_metric "$BEST_METRIC"
+  --min_best_score_to_save "$MIN_BEST_SCORE_TO_SAVE"
   --batch_size "$BATCH_SIZE"
   --grad_accumulation_steps "$GRAD_ACCUMULATION_STEPS"
   --num_classes_per_sample "$NUM_CLASSES_PER_SAMPLE"
@@ -89,6 +95,7 @@ ARGS=(
   --zero_stage "$ZERO_STAGE"
   --zero_bucket_size "$ZERO_BUCKET_SIZE"
   --workers "$WORKERS"
+  --print_freq "$PRINT_FREQ"
   --save_visualizations
   --vis_samples "$VIS_SAMPLES"
 )
@@ -106,11 +113,17 @@ if [ "${USE_DIA}" = "1" ]; then
     ARGS+=(--dia_bypass_fusion)
   fi
 
-  if [ "${INIT_CON_FROM_SEG:-1}" = "1" ]; then
+  if [ "${EXPLICIT_CON}" = "1" ]; then
+    ARGS+=(--explicit_con_in_conversation)
+    ARGS+=(--init_con_from_seg)
+  elif [ "${INIT_CON_FROM_SEG:-1}" = "1" ]; then
     ARGS+=(--init_con_from_seg)
   else
     ARGS+=(--no_init_con_from_seg)
   fi
+elif [ "${EXPLICIT_CON}" = "1" ]; then
+  echo "EXPLICIT_CON=1 requires USE_DIA=1" >&2
+  exit 1
 fi
 
 if [ -n "$RESUME" ]; then
@@ -133,7 +146,7 @@ echo "  batch_size=${BATCH_SIZE}, grad_accumulation_steps=${GRAD_ACCUMULATION_ST
 echo "  zero_stage=${ZERO_STAGE}, zero_bucket_size=${ZERO_BUCKET_SIZE}"
 echo "  use_dia=${USE_DIA}"
 if [ "${USE_DIA}" = "1" ]; then
-  echo "  DIA: K=${DIA_NUM_EVIDENCE_TOKENS}, heads=${DIA_NUM_HEADS}, attn_dropout=${DIA_ATTN_DROPOUT}, attn_loss_weight=${ATTN_LOSS_WEIGHT}, bypass_fusion=${DIA_BYPASS_FUSION}"
+  echo "  DIA: K=${DIA_NUM_EVIDENCE_TOKENS}, heads=${DIA_NUM_HEADS}, attn_dropout=${DIA_ATTN_DROPOUT}, attn_loss_weight=${ATTN_LOSS_WEIGHT}, bypass_fusion=${DIA_BYPASS_FUSION}, explicit_con=${EXPLICIT_CON}"
 fi
 
 mkdir -p "$LOG_BASE_DIR"

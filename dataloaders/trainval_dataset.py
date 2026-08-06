@@ -8,6 +8,57 @@ from .reason_seg_dataset import ReasonSegDataset
 from .qa_template import SHORT_ANSWER_TEMPLATE, SHORT_QUESTION_TEMPLATE, NEG_ANSWER_TEMPLATE
 from .utils import replace_image_tokens, tokenize_and_pad, handle_conversation_specifics
 
+EXPLICIT_PAIR = "[CON][SEG]"
+
+
+def insert_explicit_con(conversation):
+    """Convert an original LISAt [SEG] answer into the explicit DIA token pair."""
+    if "[CON]" in conversation:
+        remainder = conversation.replace(EXPLICIT_PAIR, "")
+        if "[CON]" in remainder or "[SEG]" in remainder:
+            raise RuntimeError(
+                "Conversation contains an invalid [CON]/[SEG] sequence."
+            )
+        return conversation
+    return conversation.replace("[SEG]", EXPLICIT_PAIR)
+
+
+def _single_token_id(tokenizer, token):
+    token_ids = tokenizer(token, add_special_tokens=False).input_ids
+    if len(token_ids) != 1:
+        raise RuntimeError(f"{token} must tokenize to exactly one token, got {token_ids}.")
+    return token_ids[0]
+
+
+def validate_explicit_pairs(input_ids, attention_masks, tokenizer):
+    """Validate that explicit DIA conversations contain adjacent [CON][SEG] pairs."""
+    con_id = _single_token_id(tokenizer, "[CON]")
+    seg_id = _single_token_id(tokenizer, "[SEG]")
+    pair_ids = tokenizer(EXPLICIT_PAIR, add_special_tokens=False).input_ids
+    if pair_ids != [con_id, seg_id]:
+        raise RuntimeError(
+            f"{EXPLICIT_PAIR} must tokenize as adjacent [CON], [SEG], got {pair_ids}."
+        )
+
+    for row_idx, row in enumerate(input_ids):
+        valid = attention_masks[row_idx].bool()
+        valid_ids = row[valid].tolist()
+        con_pos = [idx for idx, token_id in enumerate(valid_ids) if token_id == con_id]
+        seg_pos = [idx for idx, token_id in enumerate(valid_ids) if token_id == seg_id]
+
+        if len(con_pos) != len(seg_pos):
+            raise RuntimeError(
+                "Explicit DIA requires equal [CON]/[SEG] counts after tokenization "
+                f"and truncation, row={row_idx}, con={len(con_pos)}, seg={len(seg_pos)}."
+            )
+        for pair_idx, (con_i, seg_i) in enumerate(zip(con_pos, seg_pos)):
+            if seg_i != con_i + 1:
+                raise RuntimeError(
+                    "Explicit DIA requires every [SEG] to immediately follow [CON], "
+                    f"row={row_idx}, pair={pair_idx}, con_pos={con_i}, seg_pos={seg_i}."
+                )
+
+
 try:
     from .refer_seg_dataset import ReferSegDataset as _TrainValReferSegDataset
 except ImportError as _refer_import_error:
@@ -20,7 +71,13 @@ except ImportError as _refer_import_error:
 
 
 
-def collate_fn_train(batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True):
+def collate_fn_train(
+    batch,
+    tokenizer=None,
+    conv_type="llava_v1",
+    use_mm_start_end=True,
+    explicit_con_in_conversation=False,
+):
     image_path_list = []
     images_list = []
     images_clip_list = []
@@ -50,10 +107,11 @@ def collate_fn_train(batch, tokenizer=None, conv_type="llava_v1", use_mm_start_e
     if use_mm_start_end:
         conversation_list = replace_image_tokens(conversation_list)
 
-    # Pure structural DIA keeps the original LISAt text target: [SEG].
-    # The model builds the concept/evidence branch internally from the same
-    # hidden state that predicts [SEG], so loading LISAt_PRE remains behaviorally
-    # aligned with the original baseline before the DIA residual learns to move.
+    if explicit_con_in_conversation:
+        conversation_list = [
+            insert_explicit_con(conversation)
+            for conversation in conversation_list
+        ]
 
     # Tokenization and padding of input IDs
     input_ids, attention_masks = tokenize_and_pad(conversation_list, tokenizer)
@@ -68,6 +126,9 @@ def collate_fn_train(batch, tokenizer=None, conv_type="llava_v1", use_mm_start_e
         input_ids = input_ids[:, :truncate_len]
         targets = targets[:, :truncate_len]
         attention_masks = attention_masks[:, :truncate_len]
+
+    if explicit_con_in_conversation:
+        validate_explicit_pairs(input_ids, attention_masks, tokenizer)
 
     return {
         "image_paths": image_path_list,
@@ -246,7 +307,13 @@ class HybridDataset(torch.utils.data.Dataset):
         return data[idx]
 
 
-def collate_fn_val(batch, tokenizer=None, use_mm_start_end=True, padding="right"):
+def collate_fn_val(
+    batch,
+    tokenizer=None,
+    use_mm_start_end=True,
+    padding="right",
+    explicit_con_in_conversation=False,
+):
     image_path_list = []
     images_list = []
     images_clip_list = []
@@ -276,13 +343,17 @@ def collate_fn_val(batch, tokenizer=None, use_mm_start_end=True, padding="right"
     if use_mm_start_end:
         conversation_list = replace_image_tokens(conversation_list)
 
-    # Pure structural DIA keeps the original LISAt text target: [SEG].
-    # The model builds the concept/evidence branch internally from the same
-    # hidden state that predicts [SEG], so loading LISAt_PRE remains behaviorally
-    # aligned with the original baseline before the DIA residual learns to move.
+    if explicit_con_in_conversation:
+        conversation_list = [
+            insert_explicit_con(conversation)
+            for conversation in conversation_list
+        ]
 
     # Tokenization and padding of input IDs
     input_ids, attention_masks = tokenize_and_pad(conversation_list, tokenizer, padding=padding)
+
+    if explicit_con_in_conversation:
+        validate_explicit_pairs(input_ids, attention_masks, tokenizer)
 
     return {
         "image_paths": image_path_list,
