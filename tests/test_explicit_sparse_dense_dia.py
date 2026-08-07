@@ -10,7 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from model.DIA_LISAt import DenseEvidencePrompt, ExplicitTokenBridge  # noqa: E402
-from model.LISAT import LISATForCausalLM  # noqa: E402
+from model.LISAT import LISATForCausalLM, _validate_dia_structure  # noqa: E402
 
 
 def _assert_raises(fn, exc_type=RuntimeError):
@@ -46,6 +46,33 @@ def test_token_bridge_gives_gradient_to_explicit_prompt():
     assert explicit.grad is not None
     assert explicit.grad.abs().sum().item() > 0
     assert bridge.gate[-1].bias.grad is not None
+
+
+def test_sparse_dense_validation_accepts_low_precision_gate_bias():
+    class FakeAttention:
+        dropout = 0.0
+
+    class FakeAdapter:
+        num_evidence_tokens = 1
+        cross_attn = FakeAttention()
+
+    class FakeConfig:
+        dia_fusion_mode = "sparse_dense"
+        token_bridge_init_gate = 0.02
+
+    class FakeBase:
+        config = FakeConfig()
+        evidence_adapter = FakeAdapter()
+        explicit_token_bridge = ExplicitTokenBridge(dim=8, init_gate=0.02).to(
+            torch.bfloat16
+        )
+        dense_evidence_prompt = DenseEvidencePrompt(dim=8)
+
+    class FakeModel:
+        def get_model(self):
+            return FakeBase()
+
+    _validate_dia_structure(FakeModel())
 
 
 def test_dense_prompt_is_zero_at_initialization():

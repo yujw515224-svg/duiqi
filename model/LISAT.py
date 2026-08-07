@@ -1231,7 +1231,14 @@ def _validate_dia_structure(model):
         actual_gate = torch.sigmoid(
             bridge.gate[-1].bias.detach().float()
         ).mean().item()
-        assert abs(actual_gate - expected_gate) < 1e-6
+        # The bridge bias can be materialized in fp16/bf16 during model
+        # construction, so validate the intended small gate with dtype-aware
+        # tolerance instead of requiring bit-exact sigmoid(logit(p)).
+        if abs(actual_gate - expected_gate) > 1e-4:
+            raise RuntimeError(
+                "ExplicitTokenBridge initial gate mismatch: "
+                f"expected={expected_gate}, actual={actual_gate}."
+            )
         assert torch.count_nonzero(dense.out_proj.weight.detach()).item() == 0
         assert torch.count_nonzero(dense.out_proj.bias.detach()).item() == 0
     else:
