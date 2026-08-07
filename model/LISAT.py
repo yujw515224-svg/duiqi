@@ -26,7 +26,13 @@ from .llava.model.language_model.llava_llama import (
 )
 from .segment_anything import build_sam_vit_h
 
-from .DIA_LISAt import ContextEvidenceAdapter, EvidenceGuideFusion, attention_alignment_loss
+from .DIA_LISAt import (
+    ContextEvidenceAdapter,
+    DenseEvidencePrompt,
+    EvidenceGuideFusion,
+    ExplicitTokenBridge,
+    attention_alignment_loss,
+)
 
 def dice_loss(
     inputs: torch.Tensor,
@@ -191,10 +197,23 @@ class LisatMetaModel(nn.Module):
                 num_evidence_tokens=getattr(config, "dia_num_evidence_tokens", 1),
                 dropout=getattr(config, "dia_attn_dropout", 0.0),
             )
-            self.evidence_fusion = EvidenceGuideFusion(
-                dim=out_dim,
-                dropout=getattr(config, "fusion_dropout", 0.0),
-            )
+            fusion_mode = getattr(config, "dia_fusion_mode", "legacy")
+            if fusion_mode == "legacy":
+                self.evidence_fusion = EvidenceGuideFusion(
+                    dim=out_dim,
+                    dropout=getattr(config, "fusion_dropout", 0.0),
+                )
+            elif fusion_mode == "sparse_dense":
+                self.explicit_token_bridge = ExplicitTokenBridge(
+                    dim=out_dim,
+                    init_gate=getattr(config, "token_bridge_init_gate", 0.02),
+                )
+                self.dense_evidence_prompt = DenseEvidencePrompt(
+                    dim=out_dim,
+                    attn_clip=getattr(config, "dense_attn_clip", 8.0),
+                )
+            else:
+                raise ValueError(f"Unsupported DIA fusion mode: {fusion_mode}")
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
         self._mark_lisat_modules_hf_initialized()
@@ -216,13 +235,19 @@ class LisatMetaModel(nn.Module):
         """
         modules = [self.visual_model, self.text_hidden_fcs]
         if self.use_dia:
-            modules.extend(
-                [
-                    self.con_hidden_fcs,
-                    self.context_adapter,
-                    self.evidence_fusion,
-                ]
-            )
+            modules.extend([self.con_hidden_fcs, self.context_adapter])
+            fusion_mode = getattr(self.config, "dia_fusion_mode", "legacy")
+            if fusion_mode == "legacy":
+                modules.append(self.evidence_fusion)
+            elif fusion_mode == "sparse_dense":
+                modules.extend(
+                    [
+                        self.explicit_token_bridge,
+                        self.dense_evidence_prompt,
+                    ]
+                )
+            else:
+                raise ValueError(f"Unsupported DIA fusion mode: {fusion_mode}")
         for module in modules:
             for submodule in module.modules():
                 submodule._is_hf_initialized = True
@@ -259,11 +284,35 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         if not self.use_dia:
             self.explicit_con_in_conversation = False
         config.explicit_con_in_conversation = self.explicit_con_in_conversation
+        self.dia_fusion_mode = kwargs.pop(
+            "dia_fusion_mode",
+            getattr(config, "dia_fusion_mode", "legacy"),
+        )
+        if self.dia_fusion_mode not in {"legacy", "sparse_dense"}:
+            raise ValueError(f"Unsupported dia_fusion_mode={self.dia_fusion_mode}.")
+        if self.dia_fusion_mode == "sparse_dense":
+            if not self.use_dia:
+                raise ValueError("sparse_dense DIA requires use_dia=True.")
+            if not self.explicit_con_in_conversation:
+                raise ValueError(
+                    "sparse_dense DIA requires explicit_con_in_conversation=True."
+                )
+        config.dia_fusion_mode = self.dia_fusion_mode
+        config.token_bridge_init_gate = kwargs.pop(
+            "token_bridge_init_gate",
+            getattr(config, "token_bridge_init_gate", 0.02),
+        )
+        config.dense_attn_clip = kwargs.pop(
+            "dense_attn_clip",
+            getattr(config, "dense_attn_clip", 8.0),
+        )
         self.con_token_idx = kwargs.pop("con_token_idx", None)
         self.dia_bypass_fusion = kwargs.pop(
             "dia_bypass_fusion",
             getattr(config, "dia_bypass_fusion", False),
         )
+        if self.dia_fusion_mode == "sparse_dense" and self.dia_bypass_fusion:
+            raise ValueError("--dia_bypass_fusion is incompatible with sparse_dense DIA.")
         config.dia_bypass_fusion = self.dia_bypass_fusion
         self.attn_loss_weight = kwargs.pop(
             "attn_loss_weight",
@@ -336,9 +385,17 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 [
                     self.model.con_hidden_fcs,
                     self.model.context_adapter,
-                    self.model.evidence_fusion,
                 ]
             )
+            if self.dia_fusion_mode == "legacy":
+                modules.append(self.model.evidence_fusion)
+            else:
+                modules.extend(
+                    [
+                        self.model.explicit_token_bridge,
+                        self.model.dense_evidence_prompt,
+                    ]
+                )
         return self._zero_anchor_for_modules(
             reference_loss,
             modules,
@@ -393,70 +450,6 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             token_mask = F.pad(token_mask, (0, right_pad), value=False)
         
         return token_mask[:, :hidden_len]
-
-
-
-    def build_paired_con_seg_prompt_mask(self, input_ids, hidden_len):
-        """Locate the original LISAt prompt state after inserting [CON] [SEG].
-
-        ?? LISAt ?????? [SEG] ? hidden state??DIA ??? token
-        ? [SEG] ?? [CON] [SEG] ??????????? [CON] ? hidden
-        state???? [SEG] projector ? [CON] projector ????????
-        hidden state?????? mask prompt ? evidence query ????
-        """
-        if self.con_token_idx is None:
-            return torch.zeros(
-                input_ids.shape[0],
-                hidden_len,
-                dtype=torch.bool,
-                device=input_ids.device,
-            )
-
-        con_next = input_ids[:, 1:] == self.con_token_idx
-        seg_after_con = torch.zeros_like(con_next)
-        # Tokenizers can encode "[CON] [SEG]" as [CON], whitespace, [SEG].
-        # Treat a nearby following [SEG] as paired with [CON], so the prompt
-        # state remains the one that predicts [CON].
-        max_pair_gap = 4
-        for gap in range(1, max_pair_gap + 1):
-            if input_ids.shape[1] > 1 + gap:
-                seg_after_con[:, :-gap] = seg_after_con[:, :-gap] | (
-                    input_ids[:, 1 + gap:] == self.seg_token_idx
-                )
-        token_mask = con_next & seg_after_con
-
-        left_pad = self.get_vision_tower().num_patches - 1
-        token_mask = torch.cat(
-            [
-                torch.zeros(
-                    token_mask.shape[0],
-                    left_pad,
-                    dtype=torch.bool,
-                    device=token_mask.device,
-                ),
-                token_mask,
-            ],
-            dim=1,
-        )
-
-        if token_mask.shape[1] < hidden_len:
-            right_pad = hidden_len - token_mask.shape[1]
-            token_mask = F.pad(token_mask, (0, right_pad), value=False)
-
-        return token_mask[:, :hidden_len]
-
-    def build_dia_prompt_token_mask(self, input_ids, seg_token_mask, hidden_len):
-        """Use paired [CON] [SEG] states, with old [SEG] states as fallback."""
-        prompt_token_mask = self.build_paired_con_seg_prompt_mask(
-            input_ids=input_ids,
-            hidden_len=hidden_len,
-        )
-        missing_pair = prompt_token_mask.int().sum(-1) == 0
-        if missing_pair.any():
-            # ????????????? [SEG] ????????????????
-            prompt_token_mask = prompt_token_mask.clone()
-            prompt_token_mask[missing_pair] = seg_token_mask[missing_pair]
-        return prompt_token_mask
 
     def validate_explicit_con_seg_pairs(self, input_ids):
         """Check raw token IDs before hidden-state shifting."""
@@ -535,7 +528,14 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
         return grouped
 
-    def generate_pred_masks(self, seg_embeddings, con_embeddings, image_embeddings, sam_mask_shape_list):
+    def generate_pred_masks(
+        self,
+        seg_embeddings,
+        con_embeddings,
+        image_embeddings,
+        sam_mask_shape_list,
+        anchor_embeddings=None,
+    ):
         """Generate predicted masks from SAM prompt embeddings.
 
         Baseline mode (use_dia=False) keeps the original LISAt behavior: a
@@ -548,10 +548,18 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         debug_stats = {
             "gate_means": [],
             "attention_entropies": [],
+            "token_gate_means": [],
+            "token_delta_ratios": [],
+            "dense_delta_ratios": [],
         }
         for i in range(len(seg_embeddings)):
             seg_i = seg_embeddings[i]
             con_i = con_embeddings[i] if self.use_dia and con_embeddings is not None else None
+            anchor_i = (
+                anchor_embeddings[i]
+                if anchor_embeddings is not None
+                else None
+            )
 
             input_size, original_size = sam_mask_shape_list[i]
             input_size = (int(input_size[0]), int(input_size[1]))
@@ -571,7 +579,21 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             if self.use_dia:
                 if con_i is None:
                     raise RuntimeError("DIA mask decoding requires concept embeddings.")
-                if self.explicit_con_in_conversation:
+                if self.dia_fusion_mode == "sparse_dense":
+                    if anchor_i is None:
+                        raise RuntimeError(
+                            "sparse_dense Explicit DIA requires baseline anchor embeddings."
+                        )
+                    if not (
+                        anchor_i.shape[0] == seg_i.shape[0] == con_i.shape[0]
+                    ):
+                        raise RuntimeError(
+                            "sparse_dense prompt counts differ: "
+                            f"image={i}, anchor={anchor_i.shape[0]}, "
+                            f"seg={seg_i.shape[0]}, con={con_i.shape[0]}."
+                        )
+                    num_prompts = seg_i.shape[0]
+                elif self.explicit_con_in_conversation:
                     if con_i.shape[0] != seg_i.shape[0]:
                         raise RuntimeError(
                             "Explicit DIA requires one [CON] embedding for every [SEG] prompt, "
@@ -587,6 +609,8 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     num_prompts = min(seg_i.shape[0], con_i.shape[0])
                 seg_i = seg_i[:num_prompts]
                 con_i = con_i[:num_prompts]
+                if anchor_i is not None:
+                    anchor_i = anchor_i[:num_prompts]
             else:
                 num_prompts = seg_i.shape[0]
                 seg_i = seg_i[:num_prompts]
@@ -597,6 +621,8 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             seg_i = seg_i.to(device=decoder_device, dtype=decoder_dtype)
             if self.use_dia:
                 con_i = con_i.to(device=decoder_device, dtype=decoder_dtype)
+                if anchor_i is not None:
+                    anchor_i = anchor_i.to(device=decoder_device, dtype=decoder_dtype)
 
             image_i = image_embeddings[i].unsqueeze(0).to(dtype=decoder_dtype)
             image_pe = self.model.visual_model.prompt_encoder.get_dense_pe().to(
@@ -609,7 +635,40 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     image_embeddings=image_i,
                     image_pe=image_pe,
                 )
-                if getattr(self, "dia_bypass_fusion", False):
+                dense_delta = None
+                if self.dia_fusion_mode == "sparse_dense":
+                    prompt_tokens = self.model.explicit_token_bridge(
+                        anchor_embeddings=anchor_i,
+                        explicit_embeddings=seg_i,
+                    ).unsqueeze(1)
+                    dense_delta = self.model.dense_evidence_prompt(
+                        image_embeddings=image_i,
+                        evidence_tokens=evidence_tokens,
+                        attn_maps=attn_maps,
+                    )
+                    token_gate_mean = getattr(
+                        self.model.explicit_token_bridge,
+                        "last_gate_mean",
+                        None,
+                    )
+                    token_delta_ratio = getattr(
+                        self.model.explicit_token_bridge,
+                        "last_delta_ratio",
+                        None,
+                    )
+                    dense_delta_ratio = getattr(
+                        self.model.dense_evidence_prompt,
+                        "last_delta_ratio",
+                        None,
+                    )
+                    if token_gate_mean is not None:
+                        debug_stats["token_gate_means"].append(token_gate_mean)
+                    if token_delta_ratio is not None:
+                        debug_stats["token_delta_ratios"].append(token_delta_ratio)
+                    if dense_delta_ratio is not None:
+                        debug_stats["dense_delta_ratios"].append(dense_delta_ratio)
+                    gate_mean = None
+                elif getattr(self, "dia_bypass_fusion", False):
                     prompt_tokens = seg_i.unsqueeze(1)
                     gate_mean = None
                 else:
@@ -641,6 +700,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             # training does not hit Float x BFloat16 linear layers.
             sparse_embeddings = sparse_embeddings.to(device=decoder_device, dtype=decoder_dtype)
             dense_embeddings = dense_embeddings.to(device=decoder_device, dtype=decoder_dtype)
+            if self.use_dia and self.dia_fusion_mode == "sparse_dense":
+                dense_embeddings = dense_embeddings + dense_delta.to(
+                    device=decoder_device,
+                    dtype=decoder_dtype,
+                )
 
             low_res_masks, _ = self.model.visual_model.mask_decoder(
                 image_embeddings=image_i,
@@ -739,6 +803,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         seg_hidden = last_hidden_state[seg_token_mask]
         seg_flat = self.model.text_hidden_fcs[0](seg_hidden)
         seg_embeddings = self.split_embeddings_by_offset(seg_flat, seg_token_mask, offset)
+        anchor_embeddings = None
         if self.use_dia:
             con_hidden = last_hidden_state[con_token_mask]
             if con_hidden.shape[0] != seg_hidden.shape[0]:
@@ -752,6 +817,13 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 con_token_mask,
                 offset,
             )
+            if self.dia_fusion_mode == "sparse_dense":
+                anchor_flat = self.model.text_hidden_fcs[0](con_hidden)
+                anchor_embeddings = self.split_embeddings_by_offset(
+                    anchor_flat,
+                    con_token_mask,
+                    offset,
+                )
         else:
             con_hidden = None
             con_embeddings = None
@@ -765,6 +837,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             con_embeddings=con_embeddings,
             image_embeddings=image_embeddings,
             sam_mask_shape_list=sam_mask_shape_list,
+            anchor_embeddings=anchor_embeddings,
         )
 
         # If inference => return masks
@@ -810,15 +883,17 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 loss_dict["loss"]
             )
 
-        if dia_debug_stats["gate_means"]:
-            gate_mean = torch.stack(dia_debug_stats["gate_means"]).mean()
-        else:
-            gate_mean = ce_loss.new_zeros(())
-        if dia_debug_stats["attention_entropies"]:
-            attention_entropy = torch.stack(dia_debug_stats["attention_entropies"]).mean()
-        else:
-            attention_entropy = ce_loss.new_zeros(())
-        if self.use_dia:
+        def mean_or_zero(values, reference):
+            if values:
+                return torch.stack(values).mean().to(reference.device)
+            return reference.new_zeros(())
+
+        gate_mean = mean_or_zero(dia_debug_stats["gate_means"], ce_loss)
+        attention_entropy = mean_or_zero(dia_debug_stats["attention_entropies"], ce_loss)
+        token_gate_mean = mean_or_zero(dia_debug_stats["token_gate_means"], ce_loss)
+        token_delta_ratio = mean_or_zero(dia_debug_stats["token_delta_ratios"], ce_loss)
+        dense_delta_ratio = mean_or_zero(dia_debug_stats["dense_delta_ratios"], ce_loss)
+        if self.use_dia and self.dia_fusion_mode == "legacy":
             res_scale = torch.tanh(self.model.evidence_fusion.res_scale.detach()).to(ce_loss.device)
         else:
             res_scale = ce_loss.new_zeros(())
@@ -854,6 +929,10 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         loss_dict["res_scale"] = res_scale
         loss_dict["gate_mean"] = gate_mean.detach()
         loss_dict["attention_entropy"] = attention_entropy.detach()
+        loss_dict["valid_attention_entropy"] = attention_entropy.detach()
+        loss_dict["token_gate_mean"] = token_gate_mean.detach()
+        loss_dict["token_delta_ratio"] = token_delta_ratio.detach()
+        loss_dict["dense_delta_ratio"] = dense_delta_ratio.detach()
         loss_dict["explicit_con_count"] = explicit_con_count.detach()
         loss_dict["explicit_seg_count"] = explicit_seg_count.detach()
         loss_dict["explicit_pair_rate"] = explicit_pair_rate.detach()
@@ -969,6 +1048,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             seg_hidden = last_hidden_state[seg_token_mask]
             seg_flat = self.model.text_hidden_fcs[0](seg_hidden)
             seg_embeddings = self.split_embeddings_by_offset(seg_flat, seg_token_mask, offset)
+            anchor_embeddings = None
             if self.use_dia:
                 con_hidden = last_hidden_state[con_token_mask]
                 if con_hidden.shape[0] != seg_hidden.shape[0]:
@@ -995,6 +1075,13 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     con_token_mask,
                     offset,
                 )
+                if self.dia_fusion_mode == "sparse_dense":
+                    anchor_flat = self.model.text_hidden_fcs[0](con_hidden)
+                    anchor_embeddings = self.split_embeddings_by_offset(
+                        anchor_flat,
+                        con_token_mask,
+                        offset,
+                    )
             else:
                 con_embeddings = None
 
@@ -1006,6 +1093,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 con_embeddings=con_embeddings,
                 image_embeddings=image_embeddings,
                 sam_mask_shape_list=sam_mask_shape_list,
+                anchor_embeddings=anchor_embeddings,
             )
 
             output_pred_masks = []
@@ -1038,8 +1126,11 @@ def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **
     kwargs["device_map"] = device_map
     use_dia = kwargs.pop("use_dia", False)
     explicit_con_in_conversation = kwargs.pop("explicit_con_in_conversation", False)
+    dia_fusion_mode = kwargs.pop("dia_fusion_mode", "legacy")
     if explicit_con_in_conversation and not use_dia:
         raise RuntimeError("explicit_con_in_conversation requires use_dia=True.")
+    if dia_fusion_mode == "sparse_dense" and not explicit_con_in_conversation:
+        raise RuntimeError("sparse_dense DIA requires explicit_con_in_conversation=True.")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
@@ -1062,6 +1153,7 @@ def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **
         con_token_idx=con_token_idx,
         use_dia=use_dia,
         explicit_con_in_conversation=explicit_con_in_conversation,
+        dia_fusion_mode=dia_fusion_mode,
         **kwargs
     )
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -1128,7 +1220,22 @@ def _validate_dia_structure(model):
     base_model = model.get_model()
     assert base_model.evidence_adapter.num_evidence_tokens == 1
     assert base_model.evidence_adapter.cross_attn.dropout == 0.0
-    assert base_model.evidence_fusion.res_scale.detach().item() == 0.0
+
+    fusion_mode = getattr(base_model.config, "dia_fusion_mode", "legacy")
+    if fusion_mode == "legacy":
+        assert base_model.evidence_fusion.res_scale.detach().item() == 0.0
+    elif fusion_mode == "sparse_dense":
+        bridge = base_model.explicit_token_bridge
+        dense = base_model.dense_evidence_prompt
+        expected_gate = getattr(base_model.config, "token_bridge_init_gate", 0.02)
+        actual_gate = torch.sigmoid(
+            bridge.gate[-1].bias.detach().float()
+        ).mean().item()
+        assert abs(actual_gate - expected_gate) < 1e-6
+        assert torch.count_nonzero(dense.out_proj.weight.detach()).item() == 0
+        assert torch.count_nonzero(dense.out_proj.bias.detach()).item() == 0
+    else:
+        raise AssertionError(f"Unknown fusion mode: {fusion_mode}")
 
 
 def _validate_explicit_tokenizer_pair(tokenizer):
@@ -1177,6 +1284,13 @@ def init_LISAT_model(args, model_args):
         "explicit_con_in_conversation",
         False,
     )
+    model_args["dia_fusion_mode"] = getattr(args, "dia_fusion_mode", "legacy")
+    model_args["token_bridge_init_gate"] = getattr(
+        args,
+        "token_bridge_init_gate",
+        0.02,
+    )
+    model_args["dense_attn_clip"] = getattr(args, "dense_attn_clip", 8.0)
 
     explicit_pair_ids = None
     if getattr(args, "explicit_con_in_conversation", False):
@@ -1209,6 +1323,9 @@ def init_LISAT_model(args, model_args):
         "explicit_con_in_conversation",
         False,
     )
+    config.dia_fusion_mode = getattr(args, "dia_fusion_mode", "legacy")
+    config.token_bridge_init_gate = getattr(args, "token_bridge_init_gate", 0.02)
+    config.dense_attn_clip = getattr(args, "dense_attn_clip", 8.0)
     config.dia_num_evidence_tokens = args.dia_num_evidence_tokens
     config.dia_num_heads = args.dia_num_heads
     config.dia_attn_dropout = args.dia_attn_dropout
@@ -1293,7 +1410,15 @@ def init_LISAT_model(args, model_args):
             lora_module_names = set()
             exclude_list = ["visual_model", "vision_tower", "mm_projector", "text_hidden_fcs"]
             if args.use_dia:
-                exclude_list.extend(["con_hidden_fcs", "context_adapter", "evidence_fusion"])
+                exclude_list.extend(
+                    [
+                        "con_hidden_fcs",
+                        "context_adapter",
+                        "evidence_fusion",
+                        "explicit_token_bridge",
+                        "dense_evidence_prompt",
+                    ]
+                )
             for name, module in model.named_modules():
                 if isinstance(module, cls) and not any(x in name for x in exclude_list) \
                    and any([x in name for x in lora_target_modules]):
@@ -1317,13 +1442,23 @@ def init_LISAT_model(args, model_args):
     # Make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
     trainable_parts = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
     if args.use_dia:
-        trainable_parts.extend(["con_hidden_fcs", "context_adapter", "evidence_fusion"])
+        trainable_parts.extend(["con_hidden_fcs", "context_adapter"])
+        if getattr(args, "dia_fusion_mode", "legacy") == "legacy":
+            trainable_parts.append("evidence_fusion")
+        else:
+            trainable_parts.extend(["explicit_token_bridge", "dense_evidence_prompt"])
     for n, p in model.named_parameters():
         if any(part in n for part in trainable_parts):
             p.requires_grad = True
 
     if getattr(args, "local_rank", 0) == 0:
-        dia_parts = ("con_hidden_fcs", "context_adapter", "evidence_fusion")
+        dia_parts = (
+            "con_hidden_fcs",
+            "context_adapter",
+            "evidence_fusion",
+            "explicit_token_bridge",
+            "dense_evidence_prompt",
+        )
         core_trainable_params = 0
         dia_trainable_params = 0
         for name, param in model.named_parameters():

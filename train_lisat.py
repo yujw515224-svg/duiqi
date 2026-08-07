@@ -78,6 +78,10 @@ METRIC_FIELDS = [
     "explicit_seg_count",
     "explicit_pair_rate",
     "explicit_hidden_cosine",
+    "token_gate_mean",
+    "token_delta_ratio",
+    "dense_delta_ratio",
+    "valid_attention_entropy",
     "lr",
     "val_giou",
     "val_ciou",
@@ -529,6 +533,14 @@ def parse_args(args):
     parser.add_argument("--dia_attn_dropout", type=float, default=0.0)
     parser.add_argument("--fusion_dropout", type=float, default=0.0)
     parser.add_argument(
+        "--dia_fusion_mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "sparse_dense"],
+    )
+    parser.add_argument("--token_bridge_init_gate", type=float, default=0.02)
+    parser.add_argument("--dense_attn_clip", type=float, default=8.0)
+    parser.add_argument(
         "--dia_bypass_fusion",
         action="store_true",
         help="Debug only: send raw [SEG] projector output to SAM and bypass DIA fusion.",
@@ -554,6 +566,20 @@ def main(args):
         raise ValueError("--explicit_con_in_conversation requires --use_dia.")
     if args.explicit_con_in_conversation and not args.init_con_from_seg:
         raise ValueError("--explicit_con_in_conversation requires --init_con_from_seg.")
+    if args.dia_fusion_mode == "sparse_dense":
+        if not args.use_dia:
+            raise ValueError("sparse_dense requires --use_dia.")
+        if not args.explicit_con_in_conversation:
+            raise ValueError(
+                "sparse_dense requires --explicit_con_in_conversation."
+            )
+        if args.dia_bypass_fusion:
+            raise ValueError("--dia_bypass_fusion is incompatible with sparse_dense.")
+        if not 0.0 < args.token_bridge_init_gate < 0.1:
+            raise ValueError(
+                "token_bridge_init_gate must be in (0, 0.1) for the "
+                "baseline-anchored Explicit DIA experiment."
+            )
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
 
     if args.local_rank == 0:
@@ -569,9 +595,13 @@ def main(args):
         dia_con_source = None
         if args.use_dia:
             dia_con_source = (
-                "explicit_con_seg_dual_hidden"
-                if args.explicit_con_in_conversation
-                else "seg_hidden_dual_projector"
+                "explicit_sparse_dense_anchor"
+                if args.dia_fusion_mode == "sparse_dense"
+                else (
+                    "explicit_con_seg_dual_hidden"
+                    if args.explicit_con_in_conversation
+                    else "seg_hidden_dual_projector"
+                )
             )
         print(
             "[Mode] "
@@ -588,6 +618,12 @@ def main(args):
             f"attention_loss_weight={args.attn_loss_weight}, "
             f"init_con_from_seg={args.init_con_from_seg}, "
             f"dia_bypass_fusion={args.dia_bypass_fusion}"
+        )
+        print(
+            "[DIA-Architecture] "
+            f"fusion_mode={args.dia_fusion_mode}, "
+            f"token_bridge_init_gate={args.token_bridge_init_gate}, "
+            f"dense_attn_clip={args.dense_attn_clip}"
         )
 
     # ---- Init conversation template ----
@@ -611,6 +647,9 @@ def main(args):
         "fusion_dropout": args.fusion_dropout,
         "dia_bypass_fusion": args.dia_bypass_fusion,
         "explicit_con_in_conversation": args.explicit_con_in_conversation,
+        "dia_fusion_mode": args.dia_fusion_mode,
+        "token_bridge_init_gate": args.token_bridge_init_gate,
+        "dense_attn_clip": args.dense_attn_clip,
 
     }
     tokenizer, model, vision_tower = init_LISAT_model(args, model_args)
@@ -1012,6 +1051,37 @@ def main(args):
         model_engine.save_checkpoint(save_dir)
 
 
+def _grad_norm_by_keywords(model, keywords):
+    module = getattr(model, "module", model)
+    total_sq = 0.0
+    for name, param in module.named_parameters():
+        if not any(keyword in name for keyword in keywords):
+            continue
+        grad = param.grad
+        if grad is None:
+            continue
+        total_sq += grad.detach().float().norm().item() ** 2
+    return total_sq ** 0.5
+
+
+def _print_early_grad_diagnostics(model, global_step, args):
+    if getattr(args, "local_rank", 0) != 0 or global_step >= 20 or global_step % 10 != 0:
+        return
+    diagnostics = {
+        "grad_text_hidden_fcs": ["text_hidden_fcs"],
+        "grad_con_hidden_fcs": ["con_hidden_fcs"],
+        "grad_context_adapter": ["context_adapter"],
+        "grad_explicit_token_bridge": ["explicit_token_bridge"],
+        "grad_dense_evidence_out_proj": ["dense_evidence_prompt.out_proj"],
+        "grad_mask_decoder": ["mask_decoder"],
+    }
+    message = "[GradDiag] " + ", ".join(
+        f"{name}={_grad_norm_by_keywords(model, keywords):.4e}"
+        for name, keywords in diagnostics.items()
+    )
+    print(message)
+
+
 def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     """Main training loop (one epoch)."""
     keys = [
@@ -1030,6 +1100,10 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
         "explicit_seg_count",
         "explicit_pair_rate",
         "explicit_hidden_cosine",
+        "token_gate_mean",
+        "token_delta_ratio",
+        "dense_delta_ratio",
+        "valid_attention_entropy",
     ]
     loss_meters = {k: AverageMeter(k, ":.4f") for k in keys}
 
@@ -1042,7 +1116,7 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     model.train()
 
     for global_step in range(args.steps_per_epoch):
-        for _ in range(args.grad_accumulation_steps):
+        for micro_step in range(args.grad_accumulation_steps):
             try:
                 input_dict = next(train_iter)
             except StopIteration:
@@ -1053,10 +1127,17 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
             output_dict = model(**input_dict)
 
             batch_size = input_dict["images"].size(0)
+            num_valid_attn = output_dict["num_valid_attn_masks"].item()
             for k in keys:
-                loss_meters[k].update(output_dict[k].item(), batch_size)
+                if k == "valid_attention_entropy":
+                    if num_valid_attn > 0:
+                        loss_meters[k].update(output_dict[k].item(), num_valid_attn)
+                else:
+                    loss_meters[k].update(output_dict[k].item(), batch_size)
 
             model.backward(output_dict["loss"])
+            if micro_step == args.grad_accumulation_steps - 1:
+                _print_early_grad_diagnostics(model, global_step, args)
             model.step()
 
         # Log + reset

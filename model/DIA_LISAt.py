@@ -1,6 +1,10 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .segment_anything.modeling.common import LayerNorm2d
 
 
 class ContextEvidenceAdapter(nn.Module):
@@ -58,6 +62,151 @@ class ContextEvidenceAdapter(nn.Module):
         )
 
         return evidence_tokens, attn_maps
+
+
+class ExplicitTokenBridge(nn.Module):
+    """Keep the SAM sparse prompt near the original LISAt prompt distribution."""
+
+    def __init__(self, dim=256, init_gate=0.02):
+        super().__init__()
+        if not 0.0 < init_gate < 1.0:
+            raise ValueError(f"init_gate must be in (0, 1), got {init_gate}.")
+
+        self.dim = dim
+        self.init_gate = float(init_gate)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(dim * 3),
+            nn.Linear(dim * 3, dim),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(
+            self.gate[-1].bias,
+            math.log(init_gate / (1.0 - init_gate)),
+        )
+
+        self.last_gate_mean = None
+        self.last_delta_ratio = None
+
+    def forward(self, anchor_embeddings, explicit_embeddings):
+        if anchor_embeddings.shape != explicit_embeddings.shape:
+            raise RuntimeError(
+                "ExplicitTokenBridge shape mismatch: "
+                f"anchor={anchor_embeddings.shape}, explicit={explicit_embeddings.shape}."
+            )
+        if anchor_embeddings.ndim != 2 or anchor_embeddings.shape[-1] != self.dim:
+            raise RuntimeError(
+                "ExplicitTokenBridge expects [num_prompts, dim], got "
+                f"{anchor_embeddings.shape}."
+            )
+
+        difference = explicit_embeddings - anchor_embeddings
+        gate_input = torch.cat(
+            [anchor_embeddings, explicit_embeddings, difference],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.gate(gate_input))
+        stable_embeddings = anchor_embeddings + gate * difference
+
+        with torch.no_grad():
+            self.last_gate_mean = gate.detach().float().mean()
+            self.last_delta_ratio = (
+                (stable_embeddings - anchor_embeddings)
+                .detach()
+                .float()
+                .norm(dim=-1)
+                / anchor_embeddings.detach().float().norm(dim=-1).clamp_min(1e-6)
+            ).mean()
+
+        return stable_embeddings
+
+
+class DenseEvidencePrompt(nn.Module):
+    """Convert concept attention into a residual SAM dense prompt."""
+
+    def __init__(self, dim=256, attn_clip=8.0):
+        super().__init__()
+        self.dim = dim
+        self.attn_clip = float(attn_clip)
+
+        self.in_proj = nn.Conv2d(dim * 2 + 1, dim, kernel_size=1)
+        self.norm = LayerNorm2d(dim)
+        self.act = nn.GELU()
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+        self.last_delta_ratio = None
+        self.last_attention_mean = None
+        self.last_attention_max = None
+
+    def forward(self, image_embeddings, evidence_tokens, attn_maps):
+        if image_embeddings.ndim != 4 or image_embeddings.shape[0] != 1:
+            raise RuntimeError(
+                "DenseEvidencePrompt expects one SAM image embedding "
+                f"[1, C, H, W], got {image_embeddings.shape}."
+            )
+        if evidence_tokens.ndim != 3:
+            raise RuntimeError(
+                f"evidence_tokens must be [P, K, C], got {evidence_tokens.shape}."
+            )
+        if attn_maps.ndim != 4:
+            raise RuntimeError(f"attn_maps must be [P, K, H, W], got {attn_maps.shape}.")
+
+        num_prompts, num_evidence, channels = evidence_tokens.shape
+        if channels != self.dim:
+            raise RuntimeError(
+                f"Evidence dim mismatch: expected {self.dim}, got {channels}."
+            )
+        if attn_maps.shape[:2] != (num_prompts, num_evidence):
+            raise RuntimeError(
+                "Evidence/attention shape mismatch: "
+                f"evidence={evidence_tokens.shape}, attn={attn_maps.shape}."
+            )
+
+        height, width = image_embeddings.shape[-2:]
+        if attn_maps.shape[-2:] != (height, width):
+            attn_maps = F.interpolate(
+                attn_maps.float(),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=image_embeddings.dtype)
+
+        attention = attn_maps.mean(dim=1, keepdim=True).float()
+        attention = attention / attention.mean(
+            dim=(-2, -1),
+            keepdim=True,
+        ).clamp_min(1e-6)
+        attention = attention.clamp(min=0.0, max=self.attn_clip)
+        attention = attention.to(
+            device=image_embeddings.device,
+            dtype=image_embeddings.dtype,
+        )
+
+        image = image_embeddings.expand(num_prompts, -1, -1, -1)
+        evidence = evidence_tokens.mean(dim=1)
+        evidence = evidence[:, :, None, None].expand(-1, -1, height, width)
+
+        dense_input = torch.cat(
+            [
+                image * attention,
+                evidence * attention,
+                attention,
+            ],
+            dim=1,
+        )
+        hidden = self.act(self.norm(self.in_proj(dense_input)))
+        dense_delta = self.out_proj(hidden)
+
+        with torch.no_grad():
+            self.last_delta_ratio = (
+                dense_delta.detach().float().flatten(1).norm(dim=-1)
+                / image.detach().float().flatten(1).norm(dim=-1).clamp_min(1e-6)
+            ).mean()
+            self.last_attention_mean = attention.detach().float().mean()
+            self.last_attention_max = attention.detach().float().amax()
+
+        return dense_delta
 
 
 class EvidenceGuideFusion(nn.Module):

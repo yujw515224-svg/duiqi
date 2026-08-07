@@ -18,7 +18,7 @@ VISION_TOWER="${VISION_TOWER:-/root/autodl-tmp/DIA-LISAt_code/model/remote_clip_
 VISION_PRETRAINED="${VISION_PRETRAINED:-/root/autodl-tmp/DIA-LISAt_code/sam_vit_h_4b8939.pth}"
 DATASET_DIR="${DATASET_DIR:-/root/autodl-tmp/LISAt_code/dataset}"
 LOG_BASE_DIR="${LOG_BASE_DIR:-/root/autodl-tmp/DIA-LISAt_code/runs}"
-EXP_NAME="${EXP_NAME:-dia_lisat_lr5e_reinit}"
+EXP_NAME="${EXP_NAME:-dia_explicit_sparse_dense_anchor}"
 
 DATASET="${DATASET:-sem_seg||refer_seg||correct_refer_seg||vqa||neg_refer_seg||reason_seg||geo_reason_seg}"
 SAMPLE_RATES="${SAMPLE_RATES:-15,15,2,30,1,1,36}"
@@ -57,11 +57,25 @@ ATTN_LOSS_WEIGHT="${ATTN_LOSS_WEIGHT:-0.02}"
 DIA_BYPASS_FUSION="${DIA_BYPASS_FUSION:-0}"
 USE_DIA="${USE_DIA:-1}"
 EXPLICIT_CON="${EXPLICIT_CON:-1}"
+DIA_FUSION_MODE="${DIA_FUSION_MODE:-sparse_dense}"
+TOKEN_BRIDGE_INIT_GATE="${TOKEN_BRIDGE_INIT_GATE:-0.02}"
+DENSE_ATTN_CLIP="${DENSE_ATTN_CLIP:-8.0}"
 
 RUN_BACKGROUND="${RUN_BACKGROUND:-0}"
 LOG_FILE="${LOG_FILE:-${LOG_BASE_DIR}/${EXP_NAME}_train.log}"
 RESUME="${RESUME:-}"
 AUTO_RESUME="${AUTO_RESUME:-0}"
+
+if [ "$DIA_FUSION_MODE" = "sparse_dense" ]; then
+  if [ "$USE_DIA" != "1" ] || [ "$EXPLICIT_CON" != "1" ]; then
+    echo "sparse_dense requires USE_DIA=1 and EXPLICIT_CON=1" >&2
+    exit 1
+  fi
+  if [ "$DIA_BYPASS_FUSION" = "1" ]; then
+    echo "sparse_dense cannot use DIA_BYPASS_FUSION=1" >&2
+    exit 1
+  fi
+fi
 
 ARGS=(
   train_lisat.py
@@ -108,6 +122,9 @@ if [ "${USE_DIA}" = "1" ]; then
     --dia_attn_dropout "$DIA_ATTN_DROPOUT"
     --fusion_dropout "$FUSION_DROPOUT"
     --attn_loss_weight "$ATTN_LOSS_WEIGHT"
+    --dia_fusion_mode "$DIA_FUSION_MODE"
+    --token_bridge_init_gate "$TOKEN_BRIDGE_INIT_GATE"
+    --dense_attn_clip "$DENSE_ATTN_CLIP"
   )
   if [ "${DIA_BYPASS_FUSION}" = "1" ]; then
     ARGS+=(--dia_bypass_fusion)
@@ -145,8 +162,10 @@ echo "  lr=${LR}, epochs=${EPOCHS}, steps_per_epoch=${STEPS_PER_EPOCH}"
 echo "  batch_size=${BATCH_SIZE}, grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS}"
 echo "  zero_stage=${ZERO_STAGE}, zero_bucket_size=${ZERO_BUCKET_SIZE}"
 echo "  use_dia=${USE_DIA}"
+echo "  resume=${RESUME:-None}, auto_resume=${AUTO_RESUME}"
 if [ "${USE_DIA}" = "1" ]; then
   echo "  DIA: K=${DIA_NUM_EVIDENCE_TOKENS}, heads=${DIA_NUM_HEADS}, attn_dropout=${DIA_ATTN_DROPOUT}, attn_loss_weight=${ATTN_LOSS_WEIGHT}, bypass_fusion=${DIA_BYPASS_FUSION}, explicit_con=${EXPLICIT_CON}"
+  echo "  DIA architecture: fusion_mode=${DIA_FUSION_MODE}, token_bridge_init_gate=${TOKEN_BRIDGE_INIT_GATE}, dense_attn_clip=${DENSE_ATTN_CLIP}"
 fi
 
 mkdir -p "$LOG_BASE_DIR"

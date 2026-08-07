@@ -151,6 +151,7 @@ def _fake_model(explicit=True):
     model.con_token_idx = 10
     model.use_dia = True
     model.explicit_con_in_conversation = explicit
+    model.dia_fusion_mode = "legacy"
 
     class FakeVisionTower:
         num_patches = 3
