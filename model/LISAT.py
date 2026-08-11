@@ -411,6 +411,8 @@ class LisatMetaModel(nn.Module):
             fusion_mode = getattr(self.config, "dia_fusion_mode", "legacy")
             if fusion_mode == "legacy":
                 modules.append(self.evidence_fusion)
+            elif fusion_mode == "evidence_feedback":
+                modules.append(self.evidence_fusion)
             elif fusion_mode == "faithful_evidence_fusion":
                 modules.append(self.faithful_evidence_fusion)
             elif fusion_mode == "sparse_dense":
