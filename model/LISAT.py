@@ -1,4 +1,5 @@
 from json import decoder
+import math
 import token
 from turtle import left
 from typing import List
@@ -27,11 +28,20 @@ from .llava.model.language_model.llava_llama import (
 from .segment_anything import build_sam_vit_h
 
 from .DIA_LISAt import (
+    BoundedDenseEvidencePrompt,
     ContextEvidenceAdapter,
     DenseEvidencePrompt,
     EvidenceGuideFusion,
+    EvidenceGuideFusionV2,
+    EvidenceVisualBottleneck,
+    ExplicitRoleAdapter,
     ExplicitTokenBridge,
+    FaithfulEvidenceFusion,
+    LatentSparseEvidenceFusion,
+    SharedEvidenceAdapter,
     attention_alignment_loss,
+    evidence_map_loss,
+    prompt_anchor_loss,
 )
 
 def dice_loss(
@@ -65,12 +75,18 @@ def compute_dia_loss_components(
     bce_loss_weight,
     dice_loss_weight,
     attn_loss_weight,
+    strict_prompt_alignment=False,
+    dia_fusion_mode="legacy",
+    map_loss_weight=0.0,
 ):
     mask_bce_sum = ce_loss.new_zeros(())
     mask_dice_sum = ce_loss.new_zeros(())
     attn_loss_sum = ce_loss.new_zeros(())
+    evidence_map_loss_sum = ce_loss.new_zeros(())
     num_masks = 0
     num_attn_masks = 0
+    num_evidence_masks = 0
+    use_evidence_feedback = dia_fusion_mode == "evidence_feedback"
 
     for batch_idx in range(len(pred_masks)):
         gt_mask = gt_masks[batch_idx]
@@ -99,9 +115,33 @@ def compute_dia_loss_components(
             dice_loss(pred_mask_for_loss, gt_mask_for_loss, num_masks=num_gt) * num_gt
         )
 
-        attn_maps = attn_maps_list[batch_idx]
-        if attn_maps is not None:
-            attn_count = min(int(attn_maps.shape[0]), num_gt)
+        evidence_or_attn = attn_maps_list[batch_idx]
+        if evidence_or_attn is not None and use_evidence_feedback:
+            loc_logits = evidence_or_attn
+            if int(loc_logits.shape[0]) != num_gt:
+                raise RuntimeError(
+                    "Evidence map/GT mask count mismatch: "
+                    f"maps={loc_logits.shape[0]}, gt={num_gt}."
+                )
+            evidence_map_loss_sum = evidence_map_loss_sum + (
+                evidence_map_loss(
+                    loc_logits,
+                    gt_mask.to(loc_logits.device),
+                )
+                * num_gt
+            )
+            num_evidence_masks += num_gt
+        elif evidence_or_attn is not None:
+            attn_maps = evidence_or_attn
+            if strict_prompt_alignment:
+                if int(attn_maps.shape[0]) != num_gt:
+                    raise RuntimeError(
+                        "Attention/GT mask count mismatch: "
+                        f"attn={attn_maps.shape[0]}, gt={num_gt}."
+                    )
+                attn_count = num_gt
+            else:
+                attn_count = min(int(attn_maps.shape[0]), num_gt)
             if attn_count > 0:
                 attn_loss_sum = attn_loss_sum + (
                     attention_alignment_loss(
@@ -125,18 +165,32 @@ def compute_dia_loss_components(
     else:
         attn_loss = ce_loss.new_zeros(())
 
+    if num_evidence_masks > 0:
+        evidence_map_loss_value = evidence_map_loss_sum / num_evidence_masks
+    else:
+        evidence_map_loss_value = ce_loss.new_zeros(())
+
     mask_loss = mask_bce_loss + mask_dice_loss
-    total_loss = ce_loss + mask_loss + attn_loss_weight * attn_loss
+    if use_evidence_feedback:
+        total_loss = ce_loss + mask_loss + map_loss_weight * evidence_map_loss_value
+        reported_attn_loss = evidence_map_loss_value
+        reported_attn_masks = num_evidence_masks
+    else:
+        total_loss = ce_loss + mask_loss + attn_loss_weight * attn_loss
+        reported_attn_loss = attn_loss
+        reported_attn_masks = num_attn_masks
 
     return {
         "loss": total_loss,
         "mask_bce_loss": mask_bce_loss,
         "mask_dice_loss": mask_dice_loss,
         "mask_loss": mask_loss,
-        "attn_alignment_loss": attn_loss,
-        "attn_loss": attn_loss,
+        "attn_alignment_loss": reported_attn_loss,
+        "attn_loss": reported_attn_loss,
+        "evidence_map_loss": evidence_map_loss_value,
         "num_positive_masks": ce_loss.new_tensor(float(num_masks)),
-        "num_valid_attn_masks": ce_loss.new_tensor(float(num_attn_masks)),
+        "num_valid_attn_masks": ce_loss.new_tensor(float(reported_attn_masks)),
+        "num_valid_evidence_masks": ce_loss.new_tensor(float(num_evidence_masks)),
     }
 
 
@@ -191,17 +245,52 @@ class LisatMetaModel(nn.Module):
         self.text_hidden_fcs = nn.ModuleList([build_text_project()])
         if self.use_dia:
             self.con_hidden_fcs = nn.ModuleList([build_text_project()])
-            self.context_adapter = ContextEvidenceAdapter(
-                dim=out_dim,
-                num_heads=getattr(config, "dia_num_heads", 8),
-                num_evidence_tokens=getattr(config, "dia_num_evidence_tokens", 1),
-                dropout=getattr(config, "dia_attn_dropout", 0.0),
-            )
             fusion_mode = getattr(config, "dia_fusion_mode", "legacy")
+            if fusion_mode == "evidence_feedback":
+                self.context_adapter = SharedEvidenceAdapter(
+                    dim=out_dim,
+                    num_heads=getattr(config, "dia_num_heads", 8),
+                    num_evidence_tokens=1,
+                    loc_bias_init=getattr(config, "dia_loc_bias_init", -4.0),
+                )
+                self.evidence_fusion = EvidenceGuideFusionV2(
+                    dim=out_dim,
+                    max_strength=getattr(config, "dia_fusion_max_strength", 0.15),
+                    warmup_steps=getattr(config, "dia_fusion_warmup_steps", 2000),
+                    ramp_steps=getattr(config, "dia_fusion_ramp_steps", 4000),
+                    gate_floor=getattr(config, "dia_gate_floor", 0.10),
+                    init_gate=getattr(config, "dia_init_gate", 0.50),
+                )
+            else:
+                self.context_adapter = ContextEvidenceAdapter(
+                    dim=out_dim,
+                    num_heads=getattr(config, "dia_num_heads", 8),
+                    num_evidence_tokens=getattr(config, "dia_num_evidence_tokens", 1),
+                    dropout=getattr(config, "dia_attn_dropout", 0.0),
+                )
             if fusion_mode == "legacy":
                 self.evidence_fusion = EvidenceGuideFusion(
                     dim=out_dim,
                     dropout=getattr(config, "fusion_dropout", 0.0),
+                )
+            elif fusion_mode == "faithful_evidence_fusion":
+                self.faithful_evidence_fusion = FaithfulEvidenceFusion(
+                    dim=out_dim,
+                    hidden_dim=getattr(
+                        config,
+                        "faithful_fusion_hidden_dim",
+                        out_dim,
+                    ),
+                    max_delta_ratio=getattr(
+                        config,
+                        "faithful_max_delta_ratio",
+                        0.15,
+                    ),
+                    delta_gain=getattr(
+                        config,
+                        "faithful_delta_gain",
+                        1.0,
+                    ),
                 )
             elif fusion_mode == "sparse_dense":
                 self.explicit_token_bridge = ExplicitTokenBridge(
@@ -212,6 +301,89 @@ class LisatMetaModel(nn.Module):
                     dim=out_dim,
                     attn_clip=getattr(config, "dense_attn_clip", 8.0),
                 )
+            elif fusion_mode == "bounded_sparse_dense":
+                self.explicit_role_adapter = ExplicitRoleAdapter(
+                    dim=out_dim,
+                    hidden_dim=getattr(config, "role_adapter_hidden_dim", out_dim),
+                    max_delta_ratio=getattr(config, "role_max_delta_ratio", 0.05),
+                )
+                self.bounded_dense_evidence_prompt = BoundedDenseEvidencePrompt(
+                    dim=out_dim,
+                    attn_clip=getattr(config, "dense_attn_clip", 8.0),
+                    max_delta_ratio=getattr(config, "dense_max_delta_ratio", 0.10),
+                    confidence_power=getattr(config, "dense_confidence_power", 0.5),
+                )
+            elif fusion_mode == "latent_sparse_dense_dia":
+                self.latent_sparse_fusion = LatentSparseEvidenceFusion(
+                    dim=out_dim,
+                    hidden_dim=getattr(
+                        config,
+                        "latent_sparse_hidden_dim",
+                        out_dim,
+                    ),
+                    max_delta_ratio=getattr(
+                        config,
+                        "latent_sparse_max_delta_ratio",
+                        0.40,
+                    ),
+                    delta_gain=getattr(
+                        config,
+                        "latent_sparse_delta_gain",
+                        3.0,
+                    ),
+                    target_delta_ratio=getattr(
+                        config,
+                        "evidence_target_delta_ratio",
+                        0.12,
+                    ),
+                    init_std=getattr(
+                        config,
+                        "latent_sparse_init_std",
+                        1e-3,
+                    ),
+                )
+                self.latent_dense_evidence_prompt = BoundedDenseEvidencePrompt(
+                    dim=out_dim,
+                    attn_clip=getattr(config, "dense_attn_clip", 8.0),
+                    max_delta_ratio=getattr(
+                        config,
+                        "latent_dense_max_delta_ratio",
+                        0.15,
+                    ),
+                    confidence_power=getattr(config, "dense_confidence_power", 0.25),
+                    out_proj_init_std=getattr(
+                        config,
+                        "latent_dense_init_std",
+                        1e-3,
+                    ),
+                )
+                if getattr(config, "visual_bottleneck_enabled", False):
+                    self.evidence_visual_bottleneck = EvidenceVisualBottleneck(
+                        dim=out_dim,
+                        beta=getattr(config, "visual_bottleneck_beta", 0.30),
+                        attn_clip=getattr(
+                            config,
+                            "visual_bottleneck_attn_clip",
+                            8.0,
+                        ),
+                        max_delta_ratio=getattr(
+                            config,
+                            "visual_bottleneck_max_delta_ratio",
+                            0.20,
+                        ),
+                        confidence_power=getattr(
+                            config,
+                            "visual_bottleneck_confidence_power",
+                            0.25,
+                        ),
+                        init_std=getattr(
+                            config,
+                            "visual_bottleneck_init_std",
+                            1e-3,
+                        ),
+                    )
+            elif fusion_mode == "evidence_feedback":
+                pass
             else:
                 raise ValueError(f"Unsupported DIA fusion mode: {fusion_mode}")
         for param in self.text_hidden_fcs.parameters():
@@ -239,6 +411,8 @@ class LisatMetaModel(nn.Module):
             fusion_mode = getattr(self.config, "dia_fusion_mode", "legacy")
             if fusion_mode == "legacy":
                 modules.append(self.evidence_fusion)
+            elif fusion_mode == "faithful_evidence_fusion":
+                modules.append(self.faithful_evidence_fusion)
             elif fusion_mode == "sparse_dense":
                 modules.extend(
                     [
@@ -246,6 +420,22 @@ class LisatMetaModel(nn.Module):
                         self.dense_evidence_prompt,
                     ]
                 )
+            elif fusion_mode == "bounded_sparse_dense":
+                modules.extend(
+                    [
+                        self.explicit_role_adapter,
+                        self.bounded_dense_evidence_prompt,
+                    ]
+                )
+            elif fusion_mode == "latent_sparse_dense_dia":
+                modules.extend(
+                    [
+                        self.latent_sparse_fusion,
+                        self.latent_dense_evidence_prompt,
+                    ]
+                )
+                if hasattr(self, "evidence_visual_bottleneck"):
+                    modules.append(self.evidence_visual_bottleneck)
             else:
                 raise ValueError(f"Unsupported DIA fusion mode: {fusion_mode}")
         for module in modules:
@@ -288,15 +478,40 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             "dia_fusion_mode",
             getattr(config, "dia_fusion_mode", "legacy"),
         )
-        if self.dia_fusion_mode not in {"legacy", "sparse_dense"}:
+        self.con_token_idx = kwargs.pop("con_token_idx", None)
+        if self.dia_fusion_mode not in {
+            "legacy",
+            "faithful_evidence_fusion",
+            "sparse_dense",
+            "bounded_sparse_dense",
+            "latent_sparse_dense_dia",
+            "evidence_feedback",
+        }:
             raise ValueError(f"Unsupported dia_fusion_mode={self.dia_fusion_mode}.")
-        if self.dia_fusion_mode == "sparse_dense":
+        if self.dia_fusion_mode in {
+            "sparse_dense",
+            "bounded_sparse_dense",
+            "faithful_evidence_fusion",
+            "evidence_feedback",
+        }:
             if not self.use_dia:
-                raise ValueError("sparse_dense DIA requires use_dia=True.")
+                raise ValueError(f"{self.dia_fusion_mode} DIA requires use_dia=True.")
             if not self.explicit_con_in_conversation:
                 raise ValueError(
-                    "sparse_dense DIA requires explicit_con_in_conversation=True."
+                    f"{self.dia_fusion_mode} DIA requires explicit_con_in_conversation=True."
                 )
+            if self.con_token_idx is None:
+                raise ValueError(f"{self.dia_fusion_mode} requires con_token_idx.")
+        if self.dia_fusion_mode == "latent_sparse_dense_dia":
+            if not self.use_dia:
+                raise ValueError("latent_sparse_dense_dia requires use_dia=True.")
+            if self.explicit_con_in_conversation:
+                raise ValueError(
+                    "latent_sparse_dense_dia uses an internal latent concept query; "
+                    "do not enable explicit_con_in_conversation."
+                )
+            if self.con_token_idx is None:
+                raise ValueError("latent_sparse_dense_dia requires con_token_idx.")
         config.dia_fusion_mode = self.dia_fusion_mode
         config.token_bridge_init_gate = kwargs.pop(
             "token_bridge_init_gate",
@@ -306,13 +521,135 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             "dense_attn_clip",
             getattr(config, "dense_attn_clip", 8.0),
         )
-        self.con_token_idx = kwargs.pop("con_token_idx", None)
+        config.role_adapter_hidden_dim = kwargs.pop(
+            "role_adapter_hidden_dim",
+            getattr(config, "role_adapter_hidden_dim", 256),
+        )
+        config.role_max_delta_ratio = kwargs.pop(
+            "role_max_delta_ratio",
+            getattr(config, "role_max_delta_ratio", 0.05),
+        )
+        config.dense_max_delta_ratio = kwargs.pop(
+            "dense_max_delta_ratio",
+            getattr(config, "dense_max_delta_ratio", 0.10),
+        )
+        config.dense_confidence_power = kwargs.pop(
+            "dense_confidence_power",
+            getattr(config, "dense_confidence_power", 0.5),
+        )
+        config.faithful_fusion_hidden_dim = kwargs.pop(
+            "faithful_fusion_hidden_dim",
+            getattr(config, "faithful_fusion_hidden_dim", 256),
+        )
+        config.faithful_max_delta_ratio = kwargs.pop(
+            "faithful_max_delta_ratio",
+            getattr(config, "faithful_max_delta_ratio", 0.15),
+        )
+        config.faithful_delta_gain = kwargs.pop(
+            "faithful_delta_gain",
+            getattr(config, "faithful_delta_gain", 1.0),
+        )
+        config.faithful_strict_config = kwargs.pop(
+            "faithful_strict_config",
+            getattr(config, "faithful_strict_config", False),
+        )
+        config.latent_sparse_hidden_dim = kwargs.pop(
+            "latent_sparse_hidden_dim",
+            getattr(config, "latent_sparse_hidden_dim", 256),
+        )
+        config.latent_sparse_max_delta_ratio = kwargs.pop(
+            "latent_sparse_max_delta_ratio",
+            getattr(config, "latent_sparse_max_delta_ratio", 0.40),
+        )
+        config.latent_sparse_delta_gain = kwargs.pop(
+            "latent_sparse_delta_gain",
+            getattr(config, "latent_sparse_delta_gain", 3.0),
+        )
+        config.latent_sparse_init_std = kwargs.pop(
+            "latent_sparse_init_std",
+            getattr(config, "latent_sparse_init_std", 1e-3),
+        )
+        config.latent_dense_max_delta_ratio = kwargs.pop(
+            "latent_dense_max_delta_ratio",
+            getattr(config, "latent_dense_max_delta_ratio", 0.15),
+        )
+        config.latent_dense_init_std = kwargs.pop(
+            "latent_dense_init_std",
+            getattr(config, "latent_dense_init_std", 1e-3),
+        )
+        config.visual_bottleneck_enabled = kwargs.pop(
+            "visual_bottleneck_enabled",
+            getattr(config, "visual_bottleneck_enabled", False),
+        )
+        config.visual_bottleneck_beta = kwargs.pop(
+            "visual_bottleneck_beta",
+            getattr(config, "visual_bottleneck_beta", 0.30),
+        )
+        config.visual_bottleneck_attn_clip = kwargs.pop(
+            "visual_bottleneck_attn_clip",
+            getattr(config, "visual_bottleneck_attn_clip", 8.0),
+        )
+        config.visual_bottleneck_max_delta_ratio = kwargs.pop(
+            "visual_bottleneck_max_delta_ratio",
+            getattr(config, "visual_bottleneck_max_delta_ratio", 0.20),
+        )
+        config.visual_bottleneck_confidence_power = kwargs.pop(
+            "visual_bottleneck_confidence_power",
+            getattr(config, "visual_bottleneck_confidence_power", 0.25),
+        )
+        config.visual_bottleneck_init_std = kwargs.pop(
+            "visual_bottleneck_init_std",
+            getattr(config, "visual_bottleneck_init_std", 1e-3),
+        )
+        self.evidence_usage_loss_weight = kwargs.pop(
+            "evidence_usage_loss_weight",
+            getattr(config, "evidence_usage_loss_weight", 0.10),
+        )
+        self.evidence_target_delta_ratio = kwargs.pop(
+            "evidence_target_delta_ratio",
+            getattr(config, "evidence_target_delta_ratio", 0.12),
+        )
+        self.area_recall_loss_weight = kwargs.pop(
+            "area_recall_loss_weight",
+            getattr(config, "area_recall_loss_weight", 0.20),
+        )
+        self.dia_training_stage = kwargs.pop(
+            "dia_training_stage",
+            getattr(config, "dia_training_stage", "one_stage"),
+        )
+        self.dia_stage1_ce_loss_weight = kwargs.pop(
+            "dia_stage1_ce_loss_weight",
+            getattr(config, "dia_stage1_ce_loss_weight", 0.25),
+        )
+        self.dia_stage1_attn_loss_weight = kwargs.pop(
+            "dia_stage1_attn_loss_weight",
+            getattr(config, "dia_stage1_attn_loss_weight", 0.25),
+        )
+        self.dia_stage1_evidence_usage_loss_weight = kwargs.pop(
+            "dia_stage1_evidence_usage_loss_weight",
+            getattr(config, "dia_stage1_evidence_usage_loss_weight", 0.10),
+        )
+        self.dia_stage1_area_recall_loss_weight = kwargs.pop(
+            "dia_stage1_area_recall_loss_weight",
+            getattr(config, "dia_stage1_area_recall_loss_weight", 0.0),
+        )
         self.dia_bypass_fusion = kwargs.pop(
             "dia_bypass_fusion",
             getattr(config, "dia_bypass_fusion", False),
         )
-        if self.dia_fusion_mode == "sparse_dense" and self.dia_bypass_fusion:
-            raise ValueError("--dia_bypass_fusion is incompatible with sparse_dense DIA.")
+        if (
+            self.dia_fusion_mode in {
+                "sparse_dense",
+                "bounded_sparse_dense",
+                "faithful_evidence_fusion",
+                "latent_sparse_dense_dia",
+                "evidence_feedback",
+            }
+            and self.dia_bypass_fusion
+        ):
+            raise ValueError(
+                f"--dia_bypass_fusion is incompatible with {self.dia_fusion_mode} DIA."
+            )
         config.dia_bypass_fusion = self.dia_bypass_fusion
         self.attn_loss_weight = kwargs.pop(
             "attn_loss_weight",
@@ -320,6 +657,20 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         )
         if not self.use_dia:
             self.attn_loss_weight = 0.0
+            self.evidence_usage_loss_weight = 0.0
+            self.area_recall_loss_weight = 0.0
+        config.evidence_usage_loss_weight = self.evidence_usage_loss_weight
+        config.evidence_target_delta_ratio = self.evidence_target_delta_ratio
+        config.area_recall_loss_weight = self.area_recall_loss_weight
+        config.dia_training_stage = self.dia_training_stage
+        config.dia_stage1_ce_loss_weight = self.dia_stage1_ce_loss_weight
+        config.dia_stage1_attn_loss_weight = self.dia_stage1_attn_loss_weight
+        config.dia_stage1_evidence_usage_loss_weight = (
+            self.dia_stage1_evidence_usage_loss_weight
+        )
+        config.dia_stage1_area_recall_loss_weight = (
+            self.dia_stage1_area_recall_loss_weight
+        )
         config.dia_num_heads = kwargs.pop("dia_num_heads", getattr(config, "dia_num_heads", 8))
         config.dia_num_evidence_tokens = kwargs.pop(
             "dia_num_evidence_tokens",
@@ -334,6 +685,131 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             getattr(config, "fusion_dropout", 0.0),
         )
         config.attn_loss_weight = self.attn_loss_weight
+        self.map_loss_weight = kwargs.pop(
+            "map_loss_weight",
+            getattr(config, "map_loss_weight", 0.10),
+        )
+        self.anchor_loss_weight = kwargs.pop(
+            "anchor_loss_weight",
+            getattr(config, "anchor_loss_weight", 0.10),
+        )
+        self.anchor_decay_steps = kwargs.pop(
+            "anchor_decay_steps",
+            getattr(config, "anchor_decay_steps", 8000),
+        )
+        config.map_loss_weight = self.map_loss_weight
+        config.anchor_loss_weight = self.anchor_loss_weight
+        config.anchor_decay_steps = self.anchor_decay_steps
+        config.dia_loc_bias_init = kwargs.pop(
+            "dia_loc_bias_init",
+            getattr(config, "dia_loc_bias_init", -4.0),
+        )
+        config.dia_fusion_max_strength = kwargs.pop(
+            "dia_fusion_max_strength",
+            getattr(config, "dia_fusion_max_strength", 0.10),
+        )
+        config.dia_fusion_warmup_steps = kwargs.pop(
+            "dia_fusion_warmup_steps",
+            getattr(config, "dia_fusion_warmup_steps", 500),
+        )
+        config.dia_fusion_ramp_steps = kwargs.pop(
+            "dia_fusion_ramp_steps",
+            getattr(config, "dia_fusion_ramp_steps", 1000),
+        )
+        config.dia_gate_floor = kwargs.pop(
+            "dia_gate_floor",
+            getattr(config, "dia_gate_floor", 0.10),
+        )
+        config.dia_init_gate = kwargs.pop(
+            "dia_init_gate",
+            getattr(config, "dia_init_gate", 0.50),
+        )
+        if self.dia_fusion_mode == "faithful_evidence_fusion":
+            if config.dia_num_evidence_tokens != 1:
+                raise ValueError("faithful_evidence_fusion requires K=1.")
+            if config.dia_num_heads != 8:
+                raise ValueError("faithful_evidence_fusion requires dia_num_heads=8.")
+            if abs(float(config.dia_attn_dropout)) > 1e-12:
+                raise ValueError("faithful_evidence_fusion requires dia_attn_dropout=0.0.")
+            if abs(float(config.fusion_dropout)) > 1e-12:
+                raise ValueError("faithful_evidence_fusion requires fusion_dropout=0.0.")
+            if config.faithful_delta_gain <= 0.0:
+                raise ValueError("faithful_evidence_fusion requires faithful_delta_gain > 0.")
+            if config.faithful_strict_config:
+                if abs(float(config.attn_loss_weight) - 0.02) > 1e-12:
+                    raise ValueError(
+                        "strict faithful_evidence_fusion requires attn_loss_weight=0.02."
+                    )
+                if abs(float(config.faithful_max_delta_ratio) - 0.15) > 1e-12:
+                    raise ValueError(
+                        "strict faithful_evidence_fusion requires "
+                        "faithful_max_delta_ratio=0.15."
+                    )
+                if abs(float(config.faithful_delta_gain) - 1.0) > 1e-12:
+                    raise ValueError(
+                        "strict faithful_evidence_fusion requires "
+                        "faithful_delta_gain=1.0."
+                    )
+        if self.dia_fusion_mode == "evidence_feedback":
+            if not self.use_dia:
+                raise ValueError("evidence_feedback requires use_dia=True.")
+            if not self.explicit_con_in_conversation:
+                raise ValueError(
+                    "evidence_feedback requires explicit_con_in_conversation=True."
+                )
+            if config.dia_num_evidence_tokens != 1:
+                raise ValueError("evidence_feedback requires K=1.")
+            if abs(float(config.dia_attn_dropout)) > 1e-12:
+                raise ValueError("evidence_feedback requires dia_attn_dropout=0.0.")
+            if self.map_loss_weight < 0.0:
+                raise ValueError("map_loss_weight must be non-negative.")
+            if self.anchor_loss_weight < 0.0:
+                raise ValueError("anchor_loss_weight must be non-negative.")
+            if int(self.anchor_decay_steps) < 0:
+                raise ValueError("anchor_decay_steps must be non-negative.")
+        if self.dia_fusion_mode == "latent_sparse_dense_dia":
+            if config.dia_num_evidence_tokens < 2:
+                raise ValueError("latent_sparse_dense_dia requires K >= 2.")
+            if config.dia_num_heads != 8:
+                raise ValueError("latent_sparse_dense_dia requires dia_num_heads=8.")
+            if abs(float(config.dia_attn_dropout)) > 1e-12:
+                raise ValueError("latent_sparse_dense_dia requires dia_attn_dropout=0.0.")
+            if config.latent_sparse_hidden_dim <= 0:
+                raise ValueError("latent_sparse_hidden_dim must be positive.")
+            if not 0.0 < config.latent_sparse_max_delta_ratio <= 0.60:
+                raise ValueError("latent_sparse_max_delta_ratio must be in (0, 0.60].")
+            if config.latent_sparse_delta_gain <= 0.0:
+                raise ValueError("latent_sparse_delta_gain must be positive.")
+            if config.latent_sparse_init_std < 0.0:
+                raise ValueError("latent_sparse_init_std must be non-negative.")
+            if not 0.0 < config.latent_dense_max_delta_ratio <= 0.20:
+                raise ValueError("latent_dense_max_delta_ratio must be in (0, 0.20].")
+            if config.latent_dense_init_std < 0.0:
+                raise ValueError("latent_dense_init_std must be non-negative.")
+            if config.visual_bottleneck_enabled:
+                if not 0.0 < config.visual_bottleneck_beta <= 1.0:
+                    raise ValueError("visual_bottleneck_beta must be in (0, 1].")
+                if config.visual_bottleneck_attn_clip <= 1.0:
+                    raise ValueError("visual_bottleneck_attn_clip must be > 1.")
+                if not 0.0 < config.visual_bottleneck_max_delta_ratio <= 0.50:
+                    raise ValueError(
+                        "visual_bottleneck_max_delta_ratio must be in (0, 0.50]."
+                    )
+                if config.visual_bottleneck_confidence_power <= 0.0:
+                    raise ValueError(
+                        "visual_bottleneck_confidence_power must be positive."
+                    )
+                if config.visual_bottleneck_init_std < 0.0:
+                    raise ValueError("visual_bottleneck_init_std must be non-negative.")
+            if self.evidence_usage_loss_weight < 0.0:
+                raise ValueError("evidence_usage_loss_weight must be non-negative.")
+            if not 0.0 <= self.evidence_target_delta_ratio <= config.latent_sparse_max_delta_ratio:
+                raise ValueError(
+                    "evidence_target_delta_ratio must be between 0 and "
+                    "latent_sparse_max_delta_ratio."
+                )
+            if self.area_recall_loss_weight < 0.0:
+                raise ValueError("area_recall_loss_weight must be non-negative.")
         if not hasattr(config, "train_mask_decoder"):
             config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
             config.mm_vision_tower = kwargs.get(
@@ -389,13 +865,33 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             )
             if self.dia_fusion_mode == "legacy":
                 modules.append(self.model.evidence_fusion)
-            else:
+            elif self.dia_fusion_mode == "evidence_feedback":
+                modules.append(self.model.evidence_fusion)
+            elif self.dia_fusion_mode == "faithful_evidence_fusion":
+                modules.append(self.model.faithful_evidence_fusion)
+            elif self.dia_fusion_mode == "sparse_dense":
                 modules.extend(
                     [
                         self.model.explicit_token_bridge,
                         self.model.dense_evidence_prompt,
                     ]
                 )
+            elif self.dia_fusion_mode == "bounded_sparse_dense":
+                modules.extend(
+                    [
+                        self.model.explicit_role_adapter,
+                        self.model.bounded_dense_evidence_prompt,
+                    ]
+                )
+            elif self.dia_fusion_mode == "latent_sparse_dense_dia":
+                modules.extend(
+                    [
+                        self.model.latent_sparse_fusion,
+                        self.model.latent_dense_evidence_prompt,
+                    ]
+                )
+            else:
+                raise RuntimeError(f"Unsupported DIA fusion mode: {self.dia_fusion_mode}")
         return self._zero_anchor_for_modules(
             reference_loss,
             modules,
@@ -408,6 +904,48 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             reference_loss,
             [self.model.con_hidden_fcs],
         )
+
+    def anchor_weight_at(self, global_step):
+        if (
+            not self.training
+            or not self.use_dia
+            or self.dia_fusion_mode != "evidence_feedback"
+        ):
+            return 0.0
+        if global_step is None:
+            raise RuntimeError("training evidence_feedback requires dia_global_step")
+        if self.anchor_decay_steps <= 0:
+            return 0.0
+        progress = min(
+            1.0,
+            int(global_step) / float(max(1, int(self.anchor_decay_steps))),
+        )
+        return float(self.anchor_loss_weight) * (1.0 - progress)
+
+    def validate_prompt_mask_counts(self, seg_embeddings, con_embeddings, masks_list):
+        if len(seg_embeddings) != len(masks_list):
+            raise RuntimeError("image-group count mismatch")
+        if self.use_dia and (
+            con_embeddings is None
+            or len(con_embeddings) != len(seg_embeddings)
+        ):
+            raise RuntimeError("DIA CON/SEG group mismatch")
+
+        for image_idx, (seg_i, gt_i) in enumerate(zip(seg_embeddings, masks_list)):
+            num_seg = int(seg_i.shape[0])
+            num_gt = int(gt_i.shape[0])
+            if num_seg != num_gt:
+                raise RuntimeError(
+                    f"[SEG]-mask mismatch: image={image_idx}, "
+                    f"seg={num_seg}, gt={num_gt}"
+                )
+            if self.use_dia:
+                num_con = int(con_embeddings[image_idx].shape[0])
+                if num_con != num_seg:
+                    raise RuntimeError(
+                        f"[CON]-[SEG] mismatch: image={image_idx}, "
+                        f"con={num_con}, seg={num_seg}"
+                    )
 
     def prepare_inputs_for_generation(
         self,
@@ -535,6 +1073,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         image_embeddings,
         sam_mask_shape_list,
         anchor_embeddings=None,
+        dia_global_step=None,
     ):
         """Generate predicted masks from SAM prompt embeddings.
 
@@ -551,6 +1090,43 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             "token_gate_means": [],
             "token_delta_ratios": [],
             "dense_delta_ratios": [],
+            "role_preclip_ratios": [],
+            "role_delta_ratios": [],
+            "role_bound_scales": [],
+            "role_bound_hit_rates": [],
+            "bounded_dense_preclip_ratios": [],
+            "bounded_dense_delta_ratios": [],
+            "bounded_dense_bound_scales": [],
+            "bounded_dense_bound_hit_rates": [],
+            "dense_confidence_means": [],
+            "dense_normalized_entropies": [],
+            "dense_relative_attention_abs_means": [],
+            "faithful_raw_delta_ratios": [],
+            "evidence_delta_ratios": [],
+            "faithful_smooth_scales": [],
+            "map_prob_means": [],
+            "map_prob_maxes": [],
+            "fusion_strengths": [],
+            "latent_sparse_raw_delta_ratios": [],
+            "latent_sparse_delta_ratios": [],
+            "latent_sparse_bound_scales": [],
+            "latent_sparse_bound_hit_rates": [],
+            "latent_dense_preclip_ratios": [],
+            "latent_dense_delta_ratios": [],
+            "latent_dense_bound_scales": [],
+            "latent_dense_bound_hit_rates": [],
+            "latent_dense_confidence_means": [],
+            "visual_bottleneck_gate_means": [],
+            "visual_bottleneck_confidence_means": [],
+            "visual_bottleneck_image_delta_ratios": [],
+            "visual_bottleneck_residual_ratios": [],
+            "visual_bottleneck_total_delta_ratios": [],
+            "visual_bottleneck_bound_scales": [],
+            "visual_bottleneck_bound_hit_rates": [],
+            "evidence_usage_losses": [],
+            "attention_normalized_entropies": [],
+            "sam_prompt_encoder_calls": [],
+            "sam_mask_decoder_calls": [],
         }
         for i in range(len(seg_embeddings)):
             seg_i = seg_embeddings[i]
@@ -579,18 +1155,39 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             if self.use_dia:
                 if con_i is None:
                     raise RuntimeError("DIA mask decoding requires concept embeddings.")
-                if self.dia_fusion_mode == "sparse_dense":
+                if self.dia_fusion_mode == "evidence_feedback":
+                    if con_i.shape[0] != seg_i.shape[0]:
+                        raise RuntimeError(
+                            "evidence_feedback requires one CON per SEG: "
+                            f"image={i}, con={con_i.shape[0]}, seg={seg_i.shape[0]}."
+                        )
+                    num_prompts = seg_i.shape[0]
+                elif self.dia_fusion_mode == "faithful_evidence_fusion":
+                    if con_i.shape[0] != seg_i.shape[0]:
+                        raise RuntimeError(
+                            "faithful_evidence_fusion requires one CON per SEG: "
+                            f"image={i}, con={con_i.shape[0]}, seg={seg_i.shape[0]}."
+                        )
+                    num_prompts = seg_i.shape[0]
+                elif self.dia_fusion_mode in {"sparse_dense", "bounded_sparse_dense"}:
                     if anchor_i is None:
                         raise RuntimeError(
-                            "sparse_dense Explicit DIA requires baseline anchor embeddings."
+                            f"{self.dia_fusion_mode} Explicit DIA requires baseline anchor embeddings."
                         )
                     if not (
                         anchor_i.shape[0] == seg_i.shape[0] == con_i.shape[0]
                     ):
                         raise RuntimeError(
-                            "sparse_dense prompt counts differ: "
+                            f"{self.dia_fusion_mode} prompt counts differ: "
                             f"image={i}, anchor={anchor_i.shape[0]}, "
                             f"seg={seg_i.shape[0]}, con={con_i.shape[0]}."
+                        )
+                    num_prompts = seg_i.shape[0]
+                elif self.dia_fusion_mode == "latent_sparse_dense_dia":
+                    if con_i.shape[0] != seg_i.shape[0]:
+                        raise RuntimeError(
+                            "latent_sparse_dense_dia requires one latent CON per SEG: "
+                            f"image={i}, con={con_i.shape[0]}, seg={seg_i.shape[0]}."
                         )
                     num_prompts = seg_i.shape[0]
                 elif self.explicit_con_in_conversation:
@@ -625,18 +1222,83 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     anchor_i = anchor_i.to(device=decoder_device, dtype=decoder_dtype)
 
             image_i = image_embeddings[i].unsqueeze(0).to(dtype=decoder_dtype)
+            decoder_image_i = image_i
             image_pe = self.model.visual_model.prompt_encoder.get_dense_pe().to(
                 device=decoder_device, dtype=decoder_dtype
             )
 
             if self.use_dia:
-                evidence_tokens, attn_maps = self.model.context_adapter(
-                    con_embeddings=con_i,
-                    image_embeddings=image_i,
-                    image_pe=image_pe,
-                )
+                if self.dia_fusion_mode == "evidence_feedback":
+                    evidence_tokens, map_probs, loc_logits = self.model.context_adapter(
+                        con_embeddings=con_i,
+                        image_embeddings=image_i,
+                        image_pe=image_pe,
+                    )
+                    attn_maps = loc_logits
+                else:
+                    evidence_tokens, attn_maps = self.model.context_adapter(
+                        con_embeddings=con_i,
+                        image_embeddings=image_i,
+                        image_pe=image_pe,
+                    )
+                    map_probs = None
                 dense_delta = None
-                if self.dia_fusion_mode == "sparse_dense":
+                if self.dia_fusion_mode == "evidence_feedback":
+                    if getattr(self, "dia_bypass_fusion", False):
+                        prompt_tokens = seg_i.unsqueeze(1)
+                    else:
+                        prompt_tokens = self.model.evidence_fusion(
+                            seg_embeddings=seg_i,
+                            evidence_tokens=evidence_tokens,
+                            global_step=dia_global_step,
+                        )
+                    fusion = self.model.evidence_fusion
+                    gate_mean = getattr(fusion, "last_gate_mean", None)
+                    delta_ratio = getattr(fusion, "last_delta_ratio", None)
+                    fusion_strength = getattr(fusion, "last_strength", None)
+                    if map_probs is not None:
+                        debug_stats["map_prob_means"].append(
+                            map_probs.detach().float().mean()
+                        )
+                        debug_stats["map_prob_maxes"].append(
+                            map_probs.detach().float().amax()
+                        )
+                    if delta_ratio is not None:
+                        debug_stats["evidence_delta_ratios"].append(
+                            delta_ratio.float().mean()
+                        )
+                    if fusion_strength is not None:
+                        debug_stats["fusion_strengths"].append(
+                            fusion_strength.float().mean()
+                        )
+                elif self.dia_fusion_mode == "faithful_evidence_fusion":
+                    prompt_tokens = self.model.faithful_evidence_fusion(
+                        seg_embeddings=seg_i,
+                        evidence_tokens=evidence_tokens,
+                    )
+                    fusion = self.model.faithful_evidence_fusion
+                    faithful_stats = {
+                        "faithful_raw_delta_ratios": getattr(
+                            fusion,
+                            "last_raw_delta_ratio",
+                            None,
+                        ),
+                        "evidence_delta_ratios": getattr(
+                            fusion,
+                            "last_delta_ratio",
+                            None,
+                        ),
+                        "faithful_smooth_scales": getattr(
+                            fusion,
+                            "last_smooth_scale",
+                            None,
+                        ),
+                    }
+                    for stat_name, stat_value in faithful_stats.items():
+                        if stat_value is not None:
+                            debug_stats[stat_name].append(stat_value.float().mean())
+                    gate_mean = None
+                elif self.dia_fusion_mode == "sparse_dense":
                     prompt_tokens = self.model.explicit_token_bridge(
                         anchor_embeddings=anchor_i,
                         explicit_embeddings=seg_i,
@@ -668,6 +1330,156 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     if dense_delta_ratio is not None:
                         debug_stats["dense_delta_ratios"].append(dense_delta_ratio)
                     gate_mean = None
+                elif self.dia_fusion_mode == "bounded_sparse_dense":
+                    prompt_tokens = self.model.explicit_role_adapter(
+                        anchor_embeddings=anchor_i,
+                        explicit_embeddings=seg_i,
+                    ).unsqueeze(1)
+                    dense_delta = self.model.bounded_dense_evidence_prompt(
+                        image_embeddings=image_i,
+                        evidence_tokens=evidence_tokens,
+                        attn_maps=attn_maps,
+                    )
+                    role = self.model.explicit_role_adapter
+                    dense = self.model.bounded_dense_evidence_prompt
+                    role_stats = {
+                        "role_preclip_ratios": getattr(role, "last_preclip_ratio", None),
+                        "role_delta_ratios": getattr(role, "last_delta_ratio", None),
+                        "role_bound_scales": getattr(role, "last_bound_scale", None),
+                        "role_bound_hit_rates": getattr(role, "last_bound_hit_rate", None),
+                    }
+                    dense_stats = {
+                        "bounded_dense_preclip_ratios": getattr(dense, "last_preclip_ratio", None),
+                        "bounded_dense_delta_ratios": getattr(dense, "last_delta_ratio", None),
+                        "bounded_dense_bound_scales": getattr(dense, "last_bound_scale", None),
+                        "bounded_dense_bound_hit_rates": getattr(dense, "last_bound_hit_rate", None),
+                        "dense_confidence_means": getattr(dense, "last_confidence_mean", None),
+                        "dense_normalized_entropies": getattr(dense, "last_normalized_entropy", None),
+                        "dense_relative_attention_abs_means": getattr(
+                            dense,
+                            "last_relative_attention_abs_mean",
+                            None,
+                        ),
+                    }
+                    for stat_name, stat_value in {**role_stats, **dense_stats}.items():
+                        if stat_value is not None:
+                            debug_stats[stat_name].append(stat_value)
+                    gate_mean = None
+                elif self.dia_fusion_mode == "latent_sparse_dense_dia":
+                    prompt_tokens = self.model.latent_sparse_fusion(
+                        seg_embeddings=seg_i,
+                        evidence_tokens=evidence_tokens,
+                    )
+                    dense_delta = self.model.latent_dense_evidence_prompt(
+                        image_embeddings=image_i,
+                        evidence_tokens=evidence_tokens,
+                        attn_maps=attn_maps,
+                    )
+                    sparse = self.model.latent_sparse_fusion
+                    dense = self.model.latent_dense_evidence_prompt
+                    latent_stats = {
+                        "latent_sparse_raw_delta_ratios": getattr(
+                            sparse,
+                            "last_raw_delta_ratio",
+                            None,
+                        ),
+                        "latent_sparse_delta_ratios": getattr(
+                            sparse,
+                            "last_delta_ratio",
+                            None,
+                        ),
+                        "latent_sparse_bound_scales": getattr(
+                            sparse,
+                            "last_bound_scale",
+                            None,
+                        ),
+                        "latent_sparse_bound_hit_rates": getattr(
+                            sparse,
+                            "last_bound_hit_rate",
+                            None,
+                        ),
+                        "latent_dense_preclip_ratios": getattr(
+                            dense,
+                            "last_preclip_ratio",
+                            None,
+                        ),
+                        "latent_dense_delta_ratios": getattr(
+                            dense,
+                            "last_delta_ratio",
+                            None,
+                        ),
+                        "latent_dense_bound_scales": getattr(
+                            dense,
+                            "last_bound_scale",
+                            None,
+                        ),
+                        "latent_dense_bound_hit_rates": getattr(
+                            dense,
+                            "last_bound_hit_rate",
+                            None,
+                        ),
+                        "latent_dense_confidence_means": getattr(
+                            dense,
+                            "last_confidence_mean",
+                            None,
+                        ),
+                    }
+                    for stat_name, stat_value in latent_stats.items():
+                        if stat_value is not None:
+                            debug_stats[stat_name].append(stat_value.float().mean())
+                    usage_loss = getattr(sparse, "last_usage_loss", None)
+                    if usage_loss is not None:
+                        debug_stats["evidence_usage_losses"].append(usage_loss)
+                    if hasattr(self.model, "evidence_visual_bottleneck"):
+                        decoder_image_i = self.model.evidence_visual_bottleneck(
+                            image_embeddings=image_i,
+                            evidence_tokens=evidence_tokens,
+                            attn_maps=attn_maps,
+                        )
+                        bottleneck = self.model.evidence_visual_bottleneck
+                        bottleneck_stats = {
+                            "visual_bottleneck_gate_means": getattr(
+                                bottleneck,
+                                "last_gate_mean",
+                                None,
+                            ),
+                            "visual_bottleneck_confidence_means": getattr(
+                                bottleneck,
+                                "last_confidence_mean",
+                                None,
+                            ),
+                            "visual_bottleneck_image_delta_ratios": getattr(
+                                bottleneck,
+                                "last_image_delta_ratio",
+                                None,
+                            ),
+                            "visual_bottleneck_residual_ratios": getattr(
+                                bottleneck,
+                                "last_residual_delta_ratio",
+                                None,
+                            ),
+                            "visual_bottleneck_total_delta_ratios": getattr(
+                                bottleneck,
+                                "last_total_delta_ratio",
+                                None,
+                            ),
+                            "visual_bottleneck_bound_scales": getattr(
+                                bottleneck,
+                                "last_bound_scale",
+                                None,
+                            ),
+                            "visual_bottleneck_bound_hit_rates": getattr(
+                                bottleneck,
+                                "last_bound_hit_rate",
+                                None,
+                            ),
+                        }
+                        for stat_name, stat_value in bottleneck_stats.items():
+                            if stat_value is not None:
+                                debug_stats[stat_name].append(
+                                    stat_value.float().mean()
+                                )
+                    gate_mean = None
                 elif getattr(self, "dia_bypass_fusion", False):
                     prompt_tokens = seg_i.unsqueeze(1)
                     gate_mean = None
@@ -681,14 +1493,28 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
                 if gate_mean is not None:
                     debug_stats["gate_means"].append(gate_mean)
-                flat_attn = attn_maps.detach().flatten(-2).clamp_min(1e-8)
-                debug_stats["attention_entropies"].append(
-                    -(flat_attn * flat_attn.log()).sum(dim=-1).mean()
+                if self.dia_fusion_mode == "evidence_feedback":
+                    flat_attn = map_probs.detach().flatten(-2)
+                    flat_attn = flat_attn / flat_attn.sum(
+                        dim=-1,
+                        keepdim=True,
+                    ).clamp_min(1e-8)
+                    flat_attn = flat_attn.clamp_min(1e-8)
+                else:
+                    flat_attn = attn_maps.detach().flatten(-2).clamp_min(1e-8)
+                entropy = -(flat_attn * flat_attn.log()).sum(dim=-1).mean()
+                debug_stats["attention_entropies"].append(entropy)
+                max_entropy = math.log(max(int(flat_attn.shape[-1]), 2))
+                debug_stats["attention_normalized_entropies"].append(
+                    (entropy / max_entropy).clamp(0.0, 1.0)
                 )
             else:
                 prompt_tokens = seg_i.unsqueeze(1)
                 attn_maps = None
 
+            debug_stats["sam_prompt_encoder_calls"].append(
+                image_embeddings.new_tensor(1.0)
+            )
             sparse_embeddings, dense_embeddings = self.model.visual_model.prompt_encoder(
                 points=None,
                 boxes=None,
@@ -700,14 +1526,21 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             # training does not hit Float x BFloat16 linear layers.
             sparse_embeddings = sparse_embeddings.to(device=decoder_device, dtype=decoder_dtype)
             dense_embeddings = dense_embeddings.to(device=decoder_device, dtype=decoder_dtype)
-            if self.use_dia and self.dia_fusion_mode == "sparse_dense":
+            if self.use_dia and self.dia_fusion_mode in {
+                "sparse_dense",
+                "bounded_sparse_dense",
+                "latent_sparse_dense_dia",
+            }:
                 dense_embeddings = dense_embeddings + dense_delta.to(
                     device=decoder_device,
                     dtype=decoder_dtype,
                 )
 
+            debug_stats["sam_mask_decoder_calls"].append(
+                image_embeddings.new_tensor(1.0)
+            )
             low_res_masks, _ = self.model.visual_model.mask_decoder(
-                image_embeddings=image_i,
+                image_embeddings=decoder_image_i,
                 image_pe=image_pe,
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
@@ -723,6 +1556,40 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         return pred_masks, attn_maps_list, debug_stats
 
 
+    def foreground_area_recall_loss(self, pred_masks, gt_masks, reference_loss):
+        """Penalize DIA when predicted foreground area is below GT foreground area."""
+        loss_sum = reference_loss.new_zeros(())
+        num_masks = 0
+
+        for pred_mask, gt_mask in zip(pred_masks, gt_masks):
+            num_gt = int(gt_mask.shape[0])
+            if num_gt == 0:
+                continue
+            if pred_mask.shape != gt_mask.shape:
+                raise RuntimeError(
+                    f"Mask shape mismatch for area recall: "
+                    f"pred={pred_mask.shape}, gt={gt_mask.shape}"
+                )
+
+            gt_mask = gt_mask.to(device=pred_mask.device)
+            valid = gt_mask.ne(255)
+            valid_count = valid.flatten(1).float().sum(-1).clamp_min(1.0)
+            pred_area = (
+                pred_mask.float().sigmoid().flatten(1)
+                * valid.flatten(1).float()
+            ).sum(-1) / valid_count
+            gt_area = (
+                gt_mask.float().flatten(1)
+                * valid.flatten(1).float()
+            ).sum(-1) / valid_count
+            loss_sum = loss_sum + F.relu(gt_area - pred_area).sum()
+            num_masks += num_gt
+
+        if num_masks == 0:
+            return reference_loss.new_zeros(())
+        return loss_sum / float(num_masks)
+
+
     def model_forward(
         self,
         images: torch.FloatTensor,
@@ -736,6 +1603,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         inference: bool = False,
         **kwargs,
     ):
+        dia_global_step = kwargs.pop("dia_global_step", None)
         batch_size = len(sam_mask_shape_list)
         assert batch_size == len(offset) - 1
 
@@ -817,7 +1685,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 con_token_mask,
                 offset,
             )
-            if self.dia_fusion_mode == "sparse_dense":
+            if self.dia_fusion_mode in {
+                "sparse_dense",
+                "bounded_sparse_dense",
+                "evidence_feedback",
+            }:
                 anchor_flat = self.model.text_hidden_fcs[0](con_hidden)
                 anchor_embeddings = self.split_embeddings_by_offset(
                     anchor_flat,
@@ -828,6 +1700,12 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             con_hidden = None
             con_embeddings = None
 
+        if (
+            self.use_dia
+            and self.dia_fusion_mode == "evidence_feedback"
+            and not inference
+        ):
+            self.validate_prompt_mask_counts(seg_embeddings, con_embeddings, masks_list)
 
         image_embeddings = self.get_visual_embs(images)
 
@@ -838,6 +1716,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             image_embeddings=image_embeddings,
             sam_mask_shape_list=sam_mask_shape_list,
             anchor_embeddings=anchor_embeddings,
+            dia_global_step=dia_global_step,
         )
 
         # If inference => return masks
@@ -872,16 +1751,23 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             bce_loss_weight=self.bce_loss_weight,
             dice_loss_weight=self.dice_loss_weight,
             attn_loss_weight=self.attn_loss_weight if self.use_dia else 0.0,
+            strict_prompt_alignment=(
+                self.use_dia
+                and self.dia_fusion_mode in {
+                    "faithful_evidence_fusion",
+                    "latent_sparse_dense_dia",
+                    "evidence_feedback",
+                }
+            ),
+            dia_fusion_mode=self.dia_fusion_mode if self.use_dia else "legacy",
+            map_loss_weight=self.map_loss_weight if self.use_dia else 0.0,
         )
 
+        graph_anchor = ce_loss.new_zeros(())
         if not has_positive_masks:
-            loss_dict["loss"] = loss_dict["loss"] + self.segmentation_zero_anchor(
-                loss_dict["loss"]
-            )
+            graph_anchor = self.segmentation_zero_anchor(loss_dict["loss"])
         elif self.use_dia and not uses_con_projector:
-            loss_dict["loss"] = loss_dict["loss"] + self.con_projector_zero_anchor(
-                loss_dict["loss"]
-            )
+            graph_anchor = self.con_projector_zero_anchor(loss_dict["loss"])
 
         def mean_or_zero(values, reference):
             if values:
@@ -893,6 +1779,194 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         token_gate_mean = mean_or_zero(dia_debug_stats["token_gate_means"], ce_loss)
         token_delta_ratio = mean_or_zero(dia_debug_stats["token_delta_ratios"], ce_loss)
         dense_delta_ratio = mean_or_zero(dia_debug_stats["dense_delta_ratios"], ce_loss)
+        role_preclip_ratio = mean_or_zero(dia_debug_stats["role_preclip_ratios"], ce_loss)
+        role_delta_ratio = mean_or_zero(dia_debug_stats["role_delta_ratios"], ce_loss)
+        role_bound_scale = mean_or_zero(dia_debug_stats["role_bound_scales"], ce_loss)
+        role_bound_hit_rate = mean_or_zero(dia_debug_stats["role_bound_hit_rates"], ce_loss)
+        bounded_dense_preclip_ratio = mean_or_zero(
+            dia_debug_stats["bounded_dense_preclip_ratios"],
+            ce_loss,
+        )
+        bounded_dense_delta_ratio = mean_or_zero(
+            dia_debug_stats["bounded_dense_delta_ratios"],
+            ce_loss,
+        )
+        bounded_dense_bound_scale = mean_or_zero(
+            dia_debug_stats["bounded_dense_bound_scales"],
+            ce_loss,
+        )
+        bounded_dense_bound_hit_rate = mean_or_zero(
+            dia_debug_stats["bounded_dense_bound_hit_rates"],
+            ce_loss,
+        )
+        dense_confidence = mean_or_zero(
+            dia_debug_stats["dense_confidence_means"],
+            ce_loss,
+        )
+        dense_normalized_entropy = mean_or_zero(
+            dia_debug_stats["dense_normalized_entropies"],
+            ce_loss,
+        )
+        dense_relative_attention_abs_mean = mean_or_zero(
+            dia_debug_stats["dense_relative_attention_abs_means"],
+            ce_loss,
+        )
+        faithful_raw_delta_ratio = mean_or_zero(
+            dia_debug_stats["faithful_raw_delta_ratios"],
+            ce_loss,
+        )
+        evidence_delta_ratio = mean_or_zero(
+            dia_debug_stats["evidence_delta_ratios"],
+            ce_loss,
+        )
+        faithful_smooth_scale = mean_or_zero(
+            dia_debug_stats["faithful_smooth_scales"],
+            ce_loss,
+        )
+        latent_sparse_raw_delta_ratio = mean_or_zero(
+            dia_debug_stats["latent_sparse_raw_delta_ratios"],
+            ce_loss,
+        )
+        latent_sparse_delta_ratio = mean_or_zero(
+            dia_debug_stats["latent_sparse_delta_ratios"],
+            ce_loss,
+        )
+        latent_sparse_bound_scale = mean_or_zero(
+            dia_debug_stats["latent_sparse_bound_scales"],
+            ce_loss,
+        )
+        latent_sparse_bound_hit_rate = mean_or_zero(
+            dia_debug_stats["latent_sparse_bound_hit_rates"],
+            ce_loss,
+        )
+        latent_dense_preclip_ratio = mean_or_zero(
+            dia_debug_stats["latent_dense_preclip_ratios"],
+            ce_loss,
+        )
+        latent_dense_delta_ratio = mean_or_zero(
+            dia_debug_stats["latent_dense_delta_ratios"],
+            ce_loss,
+        )
+        latent_dense_bound_scale = mean_or_zero(
+            dia_debug_stats["latent_dense_bound_scales"],
+            ce_loss,
+        )
+        latent_dense_bound_hit_rate = mean_or_zero(
+            dia_debug_stats["latent_dense_bound_hit_rates"],
+            ce_loss,
+        )
+        latent_dense_confidence = mean_or_zero(
+            dia_debug_stats["latent_dense_confidence_means"],
+            ce_loss,
+        )
+        visual_bottleneck_gate_mean = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_gate_means"],
+            ce_loss,
+        )
+        visual_bottleneck_confidence = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_confidence_means"],
+            ce_loss,
+        )
+        visual_bottleneck_image_delta_ratio = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_image_delta_ratios"],
+            ce_loss,
+        )
+        visual_bottleneck_residual_ratio = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_residual_ratios"],
+            ce_loss,
+        )
+        visual_bottleneck_total_delta_ratio = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_total_delta_ratios"],
+            ce_loss,
+        )
+        visual_bottleneck_bound_scale = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_bound_scales"],
+            ce_loss,
+        )
+        visual_bottleneck_bound_hit_rate = mean_or_zero(
+            dia_debug_stats["visual_bottleneck_bound_hit_rates"],
+            ce_loss,
+        )
+        evidence_usage_loss = mean_or_zero(
+            dia_debug_stats["evidence_usage_losses"],
+            ce_loss,
+        )
+        map_prob_mean = mean_or_zero(
+            dia_debug_stats["map_prob_means"],
+            ce_loss,
+        )
+        map_prob_max = mean_or_zero(
+            dia_debug_stats["map_prob_maxes"],
+            ce_loss,
+        )
+        fusion_strength = mean_or_zero(
+            dia_debug_stats["fusion_strengths"],
+            ce_loss,
+        )
+        area_recall_loss = (
+            self.foreground_area_recall_loss(
+                pred_masks,
+                gt_masks,
+                ce_loss,
+            )
+            if self.use_dia and self.dia_fusion_mode == "latent_sparse_dense_dia"
+            else ce_loss.new_zeros(())
+        )
+        anchor_loss = ce_loss.new_zeros(())
+        anchor_loss_weight = ce_loss.new_zeros(())
+        if (
+            self.use_dia
+            and self.dia_fusion_mode == "evidence_feedback"
+            and anchor_embeddings is not None
+        ):
+            anchor_weight_value = self.anchor_weight_at(dia_global_step)
+            anchor_loss_weight = ce_loss.new_tensor(anchor_weight_value)
+            if anchor_weight_value > 0.0:
+                anchor_loss = prompt_anchor_loss(seg_embeddings, anchor_embeddings)
+        if self.use_dia and self.dia_fusion_mode == "latent_sparse_dense_dia":
+            if self.training and self.dia_training_stage == "evidence":
+                # Stage 1 teaches [CON] to retrieve mask-aligned visual evidence
+                # before the SAM decoding path is allowed to dominate the loss.
+                loss_dict["loss"] = (
+                    self.dia_stage1_ce_loss_weight * ce_loss
+                    + self.dia_stage1_attn_loss_weight
+                    * loss_dict["attn_alignment_loss"]
+                    + self.dia_stage1_evidence_usage_loss_weight
+                    * evidence_usage_loss
+                    + self.dia_stage1_area_recall_loss_weight
+                    * area_recall_loss
+                    + graph_anchor
+                )
+            else:
+                loss_dict["loss"] = (
+                    loss_dict["loss"]
+                    + self.evidence_usage_loss_weight * evidence_usage_loss
+                    + self.area_recall_loss_weight * area_recall_loss
+                    + graph_anchor
+                )
+        elif self.use_dia and self.dia_fusion_mode == "evidence_feedback":
+            loss_dict["loss"] = (
+                loss_dict["loss"]
+                + anchor_loss_weight * anchor_loss
+                + graph_anchor
+            )
+        else:
+            loss_dict["loss"] = (
+                loss_dict["loss"]
+                + graph_anchor
+            )
+        attention_normalized_entropy = mean_or_zero(
+            dia_debug_stats["attention_normalized_entropies"],
+            ce_loss,
+        )
+        sam_prompt_encoder_calls = mean_or_zero(
+            dia_debug_stats["sam_prompt_encoder_calls"],
+            ce_loss,
+        )
+        sam_mask_decoder_calls = mean_or_zero(
+            dia_debug_stats["sam_mask_decoder_calls"],
+            ce_loss,
+        )
         if self.use_dia and self.dia_fusion_mode == "legacy":
             res_scale = torch.tanh(self.model.evidence_fusion.res_scale.detach()).to(ce_loss.device)
         else:
@@ -900,9 +1974,14 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
         explicit_con_count = ce_loss.new_zeros(())
         explicit_seg_count = ce_loss.new_zeros(())
+        explicit_paired_count = ce_loss.new_zeros(())
+        explicit_orphan_con_count = ce_loss.new_zeros(())
+        explicit_orphan_seg_count = ce_loss.new_zeros(())
+        explicit_invalid_row_count = ce_loss.new_zeros(())
         explicit_pair_rate = ce_loss.new_zeros(())
         explicit_hidden_cosine = ce_loss.new_zeros(())
-        if self.use_dia:
+        latent_con_count = ce_loss.new_zeros(())
+        if self.use_dia and self.explicit_con_in_conversation:
             explicit_con_count = con_token_mask.sum().to(
                 device=ce_loss.device,
                 dtype=ce_loss.dtype,
@@ -913,6 +1992,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             )
             if self.explicit_con_in_conversation:
                 # Reaching this point means raw tokens and shifted masks passed validation.
+                explicit_paired_count = explicit_seg_count
                 explicit_pair_rate = ce_loss.new_ones(())
             if (
                 con_hidden is not None
@@ -924,8 +2004,21 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     seg_hidden.detach().float(),
                     dim=-1,
                 ).mean().to(device=ce_loss.device, dtype=ce_loss.dtype)
+        elif self.use_dia and self.dia_fusion_mode == "latent_sparse_dense_dia":
+            latent_con_count = seg_token_mask.sum().to(
+                device=ce_loss.device,
+                dtype=ce_loss.dtype,
+            )
+            explicit_seg_count = latent_con_count
 
         loss_dict["ce_loss"] = ce_loss
+        loss_dict["evidence_usage_loss"] = evidence_usage_loss.detach()
+        loss_dict["area_recall_loss"] = area_recall_loss.detach()
+        loss_dict["anchor_loss"] = anchor_loss.detach()
+        loss_dict["anchor_loss_weight"] = anchor_loss_weight.detach()
+        loss_dict["map_prob_mean"] = map_prob_mean.detach()
+        loss_dict["map_prob_max"] = map_prob_max.detach()
+        loss_dict["fusion_strength"] = fusion_strength.detach()
         loss_dict["res_scale"] = res_scale
         loss_dict["gate_mean"] = gate_mean.detach()
         loss_dict["attention_entropy"] = attention_entropy.detach()
@@ -933,10 +2026,72 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         loss_dict["token_gate_mean"] = token_gate_mean.detach()
         loss_dict["token_delta_ratio"] = token_delta_ratio.detach()
         loss_dict["dense_delta_ratio"] = dense_delta_ratio.detach()
+        loss_dict["role_preclip_ratio"] = role_preclip_ratio.detach()
+        loss_dict["role_delta_ratio"] = role_delta_ratio.detach()
+        loss_dict["role_bound_scale"] = role_bound_scale.detach()
+        loss_dict["role_bound_hit_rate"] = role_bound_hit_rate.detach()
+        loss_dict["bounded_dense_preclip_ratio"] = bounded_dense_preclip_ratio.detach()
+        loss_dict["bounded_dense_delta_ratio"] = bounded_dense_delta_ratio.detach()
+        loss_dict["bounded_dense_bound_scale"] = bounded_dense_bound_scale.detach()
+        loss_dict["bounded_dense_bound_hit_rate"] = bounded_dense_bound_hit_rate.detach()
+        loss_dict["dense_confidence"] = dense_confidence.detach()
+        loss_dict["dense_normalized_entropy"] = dense_normalized_entropy.detach()
+        loss_dict["dense_relative_attention_abs_mean"] = (
+            dense_relative_attention_abs_mean.detach()
+        )
+        loss_dict["faithful_raw_delta_ratio"] = faithful_raw_delta_ratio.detach()
+        loss_dict["evidence_delta_ratio"] = evidence_delta_ratio.detach()
+        loss_dict["faithful_smooth_scale"] = faithful_smooth_scale.detach()
+        loss_dict["latent_sparse_raw_delta_ratio"] = (
+            latent_sparse_raw_delta_ratio.detach()
+        )
+        loss_dict["latent_sparse_delta_ratio"] = latent_sparse_delta_ratio.detach()
+        loss_dict["latent_sparse_bound_scale"] = latent_sparse_bound_scale.detach()
+        loss_dict["latent_sparse_bound_hit_rate"] = (
+            latent_sparse_bound_hit_rate.detach()
+        )
+        loss_dict["latent_dense_preclip_ratio"] = latent_dense_preclip_ratio.detach()
+        loss_dict["latent_dense_delta_ratio"] = latent_dense_delta_ratio.detach()
+        loss_dict["latent_dense_bound_scale"] = latent_dense_bound_scale.detach()
+        loss_dict["latent_dense_bound_hit_rate"] = (
+            latent_dense_bound_hit_rate.detach()
+        )
+        loss_dict["latent_dense_confidence"] = latent_dense_confidence.detach()
+        loss_dict["visual_bottleneck_gate_mean"] = (
+            visual_bottleneck_gate_mean.detach()
+        )
+        loss_dict["visual_bottleneck_confidence"] = (
+            visual_bottleneck_confidence.detach()
+        )
+        loss_dict["visual_bottleneck_image_delta_ratio"] = (
+            visual_bottleneck_image_delta_ratio.detach()
+        )
+        loss_dict["visual_bottleneck_residual_ratio"] = (
+            visual_bottleneck_residual_ratio.detach()
+        )
+        loss_dict["visual_bottleneck_total_delta_ratio"] = (
+            visual_bottleneck_total_delta_ratio.detach()
+        )
+        loss_dict["visual_bottleneck_bound_scale"] = (
+            visual_bottleneck_bound_scale.detach()
+        )
+        loss_dict["visual_bottleneck_bound_hit_rate"] = (
+            visual_bottleneck_bound_hit_rate.detach()
+        )
+        loss_dict["attention_normalized_entropy"] = (
+            attention_normalized_entropy.detach()
+        )
         loss_dict["explicit_con_count"] = explicit_con_count.detach()
         loss_dict["explicit_seg_count"] = explicit_seg_count.detach()
+        loss_dict["explicit_paired_count"] = explicit_paired_count.detach()
+        loss_dict["explicit_orphan_con_count"] = explicit_orphan_con_count.detach()
+        loss_dict["explicit_orphan_seg_count"] = explicit_orphan_seg_count.detach()
+        loss_dict["explicit_invalid_row_count"] = explicit_invalid_row_count.detach()
         loss_dict["explicit_pair_rate"] = explicit_pair_rate.detach()
         loss_dict["explicit_hidden_cosine"] = explicit_hidden_cosine.detach()
+        loss_dict["latent_con_count"] = latent_con_count.detach()
+        loss_dict["sam_prompt_encoder_calls"] = sam_prompt_encoder_calls.detach()
+        loss_dict["sam_mask_decoder_calls"] = sam_mask_decoder_calls.detach()
         return loss_dict
 
     #
@@ -1075,7 +2230,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     con_token_mask,
                     offset,
                 )
-                if self.dia_fusion_mode == "sparse_dense":
+                if self.dia_fusion_mode in {
+                    "sparse_dense",
+                    "bounded_sparse_dense",
+                    "evidence_feedback",
+                }:
                     anchor_flat = self.model.text_hidden_fcs[0](con_hidden)
                     anchor_embeddings = self.split_embeddings_by_offset(
                         anchor_flat,
@@ -1124,13 +2283,141 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
 def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **kwargs):
     kwargs["device_map"] = device_map
-    use_dia = kwargs.pop("use_dia", False)
-    explicit_con_in_conversation = kwargs.pop("explicit_con_in_conversation", False)
-    dia_fusion_mode = kwargs.pop("dia_fusion_mode", "legacy")
+    config = LlavaConfig.from_pretrained(model_path)
+    use_dia = kwargs.pop("use_dia", getattr(config, "use_dia", False))
+    explicit_con_in_conversation = kwargs.pop(
+        "explicit_con_in_conversation",
+        getattr(config, "explicit_con_in_conversation", False),
+    )
+    dia_fusion_mode = kwargs.pop(
+        "dia_fusion_mode",
+        getattr(config, "dia_fusion_mode", "legacy"),
+    )
     if explicit_con_in_conversation and not use_dia:
         raise RuntimeError("explicit_con_in_conversation requires use_dia=True.")
-    if dia_fusion_mode == "sparse_dense" and not explicit_con_in_conversation:
-        raise RuntimeError("sparse_dense DIA requires explicit_con_in_conversation=True.")
+    if (
+        dia_fusion_mode in {
+            "sparse_dense",
+            "bounded_sparse_dense",
+            "faithful_evidence_fusion",
+            "evidence_feedback",
+        }
+        and not explicit_con_in_conversation
+    ):
+        raise RuntimeError(
+            f"{dia_fusion_mode} DIA requires explicit_con_in_conversation=True."
+        )
+    config.use_dia = use_dia
+    config.explicit_con_in_conversation = explicit_con_in_conversation
+    config.dia_fusion_mode = dia_fusion_mode
+    config.faithful_fusion_hidden_dim = kwargs.get(
+        "faithful_fusion_hidden_dim",
+        getattr(config, "faithful_fusion_hidden_dim", 256),
+    )
+    config.faithful_max_delta_ratio = kwargs.get(
+        "faithful_max_delta_ratio",
+        getattr(config, "faithful_max_delta_ratio", 0.15),
+    )
+    config.faithful_delta_gain = kwargs.get(
+        "faithful_delta_gain",
+        getattr(config, "faithful_delta_gain", 1.0),
+    )
+    config.faithful_strict_config = kwargs.get(
+        "faithful_strict_config",
+        getattr(config, "faithful_strict_config", False),
+    )
+    config.latent_sparse_hidden_dim = kwargs.get(
+        "latent_sparse_hidden_dim",
+        getattr(config, "latent_sparse_hidden_dim", 256),
+    )
+    config.latent_sparse_max_delta_ratio = kwargs.get(
+        "latent_sparse_max_delta_ratio",
+        getattr(config, "latent_sparse_max_delta_ratio", 0.40),
+    )
+    config.latent_sparse_delta_gain = kwargs.get(
+        "latent_sparse_delta_gain",
+        getattr(config, "latent_sparse_delta_gain", 3.0),
+    )
+    config.latent_sparse_init_std = kwargs.get(
+        "latent_sparse_init_std",
+        getattr(config, "latent_sparse_init_std", 1e-3),
+    )
+    config.latent_dense_max_delta_ratio = kwargs.get(
+        "latent_dense_max_delta_ratio",
+        getattr(config, "latent_dense_max_delta_ratio", 0.15),
+    )
+    config.latent_dense_init_std = kwargs.get(
+        "latent_dense_init_std",
+        getattr(config, "latent_dense_init_std", 1e-3),
+    )
+    config.evidence_usage_loss_weight = kwargs.get(
+        "evidence_usage_loss_weight",
+        getattr(config, "evidence_usage_loss_weight", 0.10),
+    )
+    config.evidence_target_delta_ratio = kwargs.get(
+        "evidence_target_delta_ratio",
+        getattr(config, "evidence_target_delta_ratio", 0.12),
+    )
+    config.area_recall_loss_weight = kwargs.get(
+        "area_recall_loss_weight",
+        getattr(config, "area_recall_loss_weight", 0.20),
+    )
+    config.map_loss_weight = kwargs.get(
+        "map_loss_weight",
+        getattr(config, "map_loss_weight", 0.10),
+    )
+    config.anchor_loss_weight = kwargs.get(
+        "anchor_loss_weight",
+        getattr(config, "anchor_loss_weight", 0.10),
+    )
+    config.anchor_decay_steps = kwargs.get(
+        "anchor_decay_steps",
+        getattr(config, "anchor_decay_steps", 8000),
+    )
+    config.dia_loc_bias_init = kwargs.get(
+        "dia_loc_bias_init",
+        getattr(config, "dia_loc_bias_init", -4.0),
+    )
+    config.dia_fusion_max_strength = kwargs.get(
+        "dia_fusion_max_strength",
+        getattr(config, "dia_fusion_max_strength", 0.15),
+    )
+    config.dia_fusion_warmup_steps = kwargs.get(
+        "dia_fusion_warmup_steps",
+        getattr(config, "dia_fusion_warmup_steps", 2000),
+    )
+    config.dia_fusion_ramp_steps = kwargs.get(
+        "dia_fusion_ramp_steps",
+        getattr(config, "dia_fusion_ramp_steps", 4000),
+    )
+    config.dia_gate_floor = kwargs.get(
+        "dia_gate_floor",
+        getattr(config, "dia_gate_floor", 0.10),
+    )
+    config.dia_init_gate = kwargs.get(
+        "dia_init_gate",
+        getattr(config, "dia_init_gate", 0.50),
+    )
+    config.dia_training_stage = kwargs.get(
+        "dia_training_stage",
+        getattr(config, "dia_training_stage", "one_stage"),
+    )
+    config.dia_stage1_ce_loss_weight = kwargs.get(
+        "dia_stage1_ce_loss_weight",
+        getattr(config, "dia_stage1_ce_loss_weight", 0.25),
+    )
+    config.dia_stage1_attn_loss_weight = kwargs.get(
+        "dia_stage1_attn_loss_weight",
+        getattr(config, "dia_stage1_attn_loss_weight", 0.25),
+    )
+    config.dia_stage1_evidence_usage_loss_weight = kwargs.get(
+        "dia_stage1_evidence_usage_loss_weight",
+        getattr(config, "dia_stage1_evidence_usage_loss_weight", 0.10),
+    )
+    config.dia_stage1_area_recall_loss_weight = kwargs.get(
+        "dia_stage1_area_recall_loss_weight",
+        getattr(config, "dia_stage1_area_recall_loss_weight", 0.0),
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
@@ -1148,6 +2435,7 @@ def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **
 
     model = LISATForCausalLM.from_pretrained(
         model_path, 
+        config=config,
         low_cpu_mem_usage=True, 
         seg_token_idx=seg_token_idx,
         con_token_idx=con_token_idx,
@@ -1218,12 +2506,67 @@ def _copy_con_from_seg_initialization(model, seg_token_idx, con_token_idx):
 
 def _validate_dia_structure(model):
     base_model = model.get_model()
-    assert base_model.evidence_adapter.num_evidence_tokens == 1
-    assert base_model.evidence_adapter.cross_attn.dropout == 0.0
+    expected_k = getattr(base_model.config, "dia_num_evidence_tokens", 1)
+    expected_dropout = getattr(base_model.config, "dia_attn_dropout", 0.0)
 
     fusion_mode = getattr(base_model.config, "dia_fusion_mode", "legacy")
+    if fusion_mode == "evidence_feedback":
+        assert isinstance(base_model.context_adapter, SharedEvidenceAdapter)
+        assert isinstance(base_model.evidence_fusion, EvidenceGuideFusionV2)
+        assert base_model.context_adapter.num_evidence_tokens == 1
+        assert expected_k == 1
+        assert abs(expected_dropout) < 1e-12
+        expected_bias = getattr(base_model.config, "dia_loc_bias_init", -4.0)
+        actual_bias = base_model.context_adapter.loc_bias.detach().float().item()
+        if abs(actual_bias - expected_bias) > 1e-4:
+            raise RuntimeError(
+                "SharedEvidenceAdapter loc_bias mismatch: "
+                f"expected={expected_bias}, actual={actual_bias}."
+            )
+        fusion = base_model.evidence_fusion
+        assert abs(
+            fusion.max_strength
+            - getattr(base_model.config, "dia_fusion_max_strength", 0.15)
+        ) < 1e-8
+        assert fusion.warmup_steps == int(
+            getattr(base_model.config, "dia_fusion_warmup_steps", 2000)
+        )
+        assert fusion.ramp_steps == int(
+            getattr(base_model.config, "dia_fusion_ramp_steps", 4000)
+        )
+        assert not hasattr(fusion, "res_scale")
+        return
+
+    assert base_model.context_adapter.num_evidence_tokens == expected_k
+    assert abs(base_model.context_adapter.cross_attn.dropout - expected_dropout) < 1e-12
+
     if fusion_mode == "legacy":
         assert base_model.evidence_fusion.res_scale.detach().item() == 0.0
+    elif fusion_mode == "faithful_evidence_fusion":
+        fusion = base_model.faithful_evidence_fusion
+        expected_hidden_dim = getattr(
+            base_model.config,
+            "faithful_fusion_hidden_dim",
+            256,
+        )
+        expected_max_ratio = getattr(
+            base_model.config,
+            "faithful_max_delta_ratio",
+            0.15,
+        )
+        expected_delta_gain = getattr(
+            base_model.config,
+            "faithful_delta_gain",
+            1.0,
+        )
+        assert fusion.hidden_dim == expected_hidden_dim
+        assert abs(fusion.max_delta_ratio - expected_max_ratio) < 1e-8
+        assert abs(fusion.delta_gain - expected_delta_gain) < 1e-8
+        assert torch.count_nonzero(fusion.fusion_out.weight.detach()).item() == 0
+        assert fusion.evidence_norm.elementwise_affine is False
+        assert fusion.evidence_proj.bias is None
+        assert fusion.fusion_in.bias is None
+        assert fusion.fusion_out.bias is None
     elif fusion_mode == "sparse_dense":
         bridge = base_model.explicit_token_bridge
         dense = base_model.dense_evidence_prompt
@@ -1241,6 +2584,77 @@ def _validate_dia_structure(model):
             )
         assert torch.count_nonzero(dense.out_proj.weight.detach()).item() == 0
         assert torch.count_nonzero(dense.out_proj.bias.detach()).item() == 0
+    elif fusion_mode == "bounded_sparse_dense":
+        role = base_model.explicit_role_adapter
+        dense = base_model.bounded_dense_evidence_prompt
+        expected_role_cap = getattr(base_model.config, "role_max_delta_ratio", 0.05)
+        expected_dense_cap = getattr(base_model.config, "dense_max_delta_ratio", 0.10)
+        expected_confidence_power = getattr(
+            base_model.config,
+            "dense_confidence_power",
+            0.5,
+        )
+        assert torch.count_nonzero(role.role_out.weight.detach()).item() == 0
+        assert torch.count_nonzero(role.role_out.bias.detach()).item() == 0
+        assert torch.count_nonzero(dense.out_proj.weight.detach()).item() == 0
+        assert abs(role.max_delta_ratio - expected_role_cap) < 1e-8
+        assert abs(dense.max_delta_ratio - expected_dense_cap) < 1e-8
+        assert abs(dense.confidence_power - expected_confidence_power) < 1e-8
+    elif fusion_mode == "latent_sparse_dense_dia":
+        sparse = base_model.latent_sparse_fusion
+        dense = base_model.latent_dense_evidence_prompt
+        expected_sparse_cap = getattr(
+            base_model.config,
+            "latent_sparse_max_delta_ratio",
+            0.40,
+        )
+        expected_sparse_gain = getattr(
+            base_model.config,
+            "latent_sparse_delta_gain",
+            3.0,
+        )
+        expected_target_ratio = getattr(
+            base_model.config,
+            "evidence_target_delta_ratio",
+            0.12,
+        )
+        expected_dense_cap = getattr(
+            base_model.config,
+            "latent_dense_max_delta_ratio",
+            0.15,
+        )
+        assert abs(sparse.max_delta_ratio - expected_sparse_cap) < 1e-8
+        assert abs(sparse.delta_gain - expected_sparse_gain) < 1e-8
+        assert abs(sparse.target_delta_ratio - expected_target_ratio) < 1e-8
+        assert abs(dense.max_delta_ratio - expected_dense_cap) < 1e-8
+        assert sparse.evidence_norm.elementwise_affine is False
+        assert sparse.evidence_proj.bias is None
+        assert sparse.fusion_in.bias is None
+        assert sparse.fusion_out.bias is None
+        assert dense.out_proj.bias is None
+        if getattr(base_model.config, "visual_bottleneck_enabled", False):
+            bottleneck = base_model.evidence_visual_bottleneck
+            assert abs(
+                bottleneck.beta
+                - getattr(base_model.config, "visual_bottleneck_beta", 0.30)
+            ) < 1e-8
+            assert abs(
+                bottleneck.max_delta_ratio
+                - getattr(
+                    base_model.config,
+                    "visual_bottleneck_max_delta_ratio",
+                    0.20,
+                )
+            ) < 1e-8
+            assert abs(
+                bottleneck.confidence_power
+                - getattr(
+                    base_model.config,
+                    "visual_bottleneck_confidence_power",
+                    0.25,
+                )
+            ) < 1e-8
+            assert bottleneck.out_proj.bias is None
     else:
         raise AssertionError(f"Unknown fusion mode: {fusion_mode}")
 
@@ -1298,6 +2712,159 @@ def init_LISAT_model(args, model_args):
         0.02,
     )
     model_args["dense_attn_clip"] = getattr(args, "dense_attn_clip", 8.0)
+    model_args["role_adapter_hidden_dim"] = getattr(
+        args,
+        "role_adapter_hidden_dim",
+        256,
+    )
+    model_args["role_max_delta_ratio"] = getattr(args, "role_max_delta_ratio", 0.05)
+    model_args["dense_max_delta_ratio"] = getattr(args, "dense_max_delta_ratio", 0.10)
+    model_args["dense_confidence_power"] = getattr(
+        args,
+        "dense_confidence_power",
+        0.5,
+    )
+    model_args["faithful_fusion_hidden_dim"] = getattr(
+        args,
+        "faithful_fusion_hidden_dim",
+        256,
+    )
+    model_args["faithful_max_delta_ratio"] = getattr(
+        args,
+        "faithful_max_delta_ratio",
+        0.15,
+    )
+    model_args["faithful_delta_gain"] = getattr(
+        args,
+        "faithful_delta_gain",
+        1.0,
+    )
+    model_args["faithful_strict_config"] = getattr(
+        args,
+        "faithful_strict_config",
+        False,
+    )
+    model_args["latent_sparse_hidden_dim"] = getattr(
+        args,
+        "latent_sparse_hidden_dim",
+        256,
+    )
+    model_args["latent_sparse_max_delta_ratio"] = getattr(
+        args,
+        "latent_sparse_max_delta_ratio",
+        0.40,
+    )
+    model_args["latent_sparse_delta_gain"] = getattr(
+        args,
+        "latent_sparse_delta_gain",
+        3.0,
+    )
+    model_args["latent_sparse_init_std"] = getattr(
+        args,
+        "latent_sparse_init_std",
+        1e-3,
+    )
+    model_args["latent_dense_max_delta_ratio"] = getattr(
+        args,
+        "latent_dense_max_delta_ratio",
+        0.15,
+    )
+    model_args["latent_dense_init_std"] = getattr(
+        args,
+        "latent_dense_init_std",
+        1e-3,
+    )
+    model_args["visual_bottleneck_enabled"] = getattr(
+        args,
+        "visual_bottleneck_enabled",
+        False,
+    )
+    model_args["visual_bottleneck_beta"] = getattr(
+        args,
+        "visual_bottleneck_beta",
+        0.30,
+    )
+    model_args["visual_bottleneck_attn_clip"] = getattr(
+        args,
+        "visual_bottleneck_attn_clip",
+        8.0,
+    )
+    model_args["visual_bottleneck_max_delta_ratio"] = getattr(
+        args,
+        "visual_bottleneck_max_delta_ratio",
+        0.20,
+    )
+    model_args["visual_bottleneck_confidence_power"] = getattr(
+        args,
+        "visual_bottleneck_confidence_power",
+        0.25,
+    )
+    model_args["visual_bottleneck_init_std"] = getattr(
+        args,
+        "visual_bottleneck_init_std",
+        1e-3,
+    )
+    model_args["evidence_usage_loss_weight"] = getattr(
+        args,
+        "evidence_usage_loss_weight",
+        0.10,
+    )
+    model_args["evidence_target_delta_ratio"] = getattr(
+        args,
+        "evidence_target_delta_ratio",
+        0.12,
+    )
+    model_args["area_recall_loss_weight"] = getattr(
+        args,
+        "area_recall_loss_weight",
+        0.20,
+    )
+    model_args["map_loss_weight"] = getattr(args, "map_loss_weight", 0.10)
+    model_args["anchor_loss_weight"] = getattr(args, "anchor_loss_weight", 0.10)
+    model_args["anchor_decay_steps"] = getattr(args, "anchor_decay_steps", 8000)
+    model_args["dia_loc_bias_init"] = getattr(args, "dia_loc_bias_init", -4.0)
+    model_args["dia_fusion_max_strength"] = getattr(
+        args,
+        "dia_fusion_max_strength",
+        0.15,
+    )
+    model_args["dia_fusion_warmup_steps"] = getattr(
+        args,
+        "dia_fusion_warmup_steps",
+        2000,
+    )
+    model_args["dia_fusion_ramp_steps"] = getattr(
+        args,
+        "dia_fusion_ramp_steps",
+        4000,
+    )
+    model_args["dia_gate_floor"] = getattr(args, "dia_gate_floor", 0.10)
+    model_args["dia_init_gate"] = getattr(args, "dia_init_gate", 0.50)
+    model_args["dia_training_stage"] = getattr(
+        args,
+        "dia_training_stage",
+        "one_stage",
+    )
+    model_args["dia_stage1_ce_loss_weight"] = getattr(
+        args,
+        "dia_stage1_ce_loss_weight",
+        0.25,
+    )
+    model_args["dia_stage1_attn_loss_weight"] = getattr(
+        args,
+        "dia_stage1_attn_loss_weight",
+        0.25,
+    )
+    model_args["dia_stage1_evidence_usage_loss_weight"] = getattr(
+        args,
+        "dia_stage1_evidence_usage_loss_weight",
+        0.10,
+    )
+    model_args["dia_stage1_area_recall_loss_weight"] = getattr(
+        args,
+        "dia_stage1_area_recall_loss_weight",
+        0.0,
+    )
 
     explicit_pair_ids = None
     if getattr(args, "explicit_con_in_conversation", False):
@@ -1333,6 +2900,115 @@ def init_LISAT_model(args, model_args):
     config.dia_fusion_mode = getattr(args, "dia_fusion_mode", "legacy")
     config.token_bridge_init_gate = getattr(args, "token_bridge_init_gate", 0.02)
     config.dense_attn_clip = getattr(args, "dense_attn_clip", 8.0)
+    config.role_adapter_hidden_dim = getattr(args, "role_adapter_hidden_dim", 256)
+    config.role_max_delta_ratio = getattr(args, "role_max_delta_ratio", 0.05)
+    config.dense_max_delta_ratio = getattr(args, "dense_max_delta_ratio", 0.10)
+    config.dense_confidence_power = getattr(args, "dense_confidence_power", 0.5)
+    config.faithful_fusion_hidden_dim = getattr(
+        args,
+        "faithful_fusion_hidden_dim",
+        256,
+    )
+    config.faithful_max_delta_ratio = getattr(
+        args,
+        "faithful_max_delta_ratio",
+        0.15,
+    )
+    config.faithful_delta_gain = getattr(args, "faithful_delta_gain", 1.0)
+    config.faithful_strict_config = getattr(args, "faithful_strict_config", False)
+    config.latent_sparse_hidden_dim = getattr(args, "latent_sparse_hidden_dim", 256)
+    config.latent_sparse_max_delta_ratio = getattr(
+        args,
+        "latent_sparse_max_delta_ratio",
+        0.40,
+    )
+    config.latent_sparse_delta_gain = getattr(
+        args,
+        "latent_sparse_delta_gain",
+        3.0,
+    )
+    config.latent_sparse_init_std = getattr(args, "latent_sparse_init_std", 1e-3)
+    config.latent_dense_max_delta_ratio = getattr(
+        args,
+        "latent_dense_max_delta_ratio",
+        0.15,
+    )
+    config.latent_dense_init_std = getattr(args, "latent_dense_init_std", 1e-3)
+    config.visual_bottleneck_enabled = getattr(
+        args,
+        "visual_bottleneck_enabled",
+        False,
+    )
+    config.visual_bottleneck_beta = getattr(args, "visual_bottleneck_beta", 0.30)
+    config.visual_bottleneck_attn_clip = getattr(
+        args,
+        "visual_bottleneck_attn_clip",
+        8.0,
+    )
+    config.visual_bottleneck_max_delta_ratio = getattr(
+        args,
+        "visual_bottleneck_max_delta_ratio",
+        0.20,
+    )
+    config.visual_bottleneck_confidence_power = getattr(
+        args,
+        "visual_bottleneck_confidence_power",
+        0.25,
+    )
+    config.visual_bottleneck_init_std = getattr(
+        args,
+        "visual_bottleneck_init_std",
+        1e-3,
+    )
+    config.evidence_usage_loss_weight = getattr(
+        args,
+        "evidence_usage_loss_weight",
+        0.10,
+    )
+    config.evidence_target_delta_ratio = getattr(
+        args,
+        "evidence_target_delta_ratio",
+        0.12,
+    )
+    config.area_recall_loss_weight = getattr(args, "area_recall_loss_weight", 0.20)
+    config.map_loss_weight = getattr(args, "map_loss_weight", 0.10)
+    config.anchor_loss_weight = getattr(args, "anchor_loss_weight", 0.10)
+    config.anchor_decay_steps = getattr(args, "anchor_decay_steps", 8000)
+    config.dia_loc_bias_init = getattr(args, "dia_loc_bias_init", -4.0)
+    config.dia_fusion_max_strength = getattr(
+        args,
+        "dia_fusion_max_strength",
+        0.15,
+    )
+    config.dia_fusion_warmup_steps = getattr(
+        args,
+        "dia_fusion_warmup_steps",
+        2000,
+    )
+    config.dia_fusion_ramp_steps = getattr(args, "dia_fusion_ramp_steps", 4000)
+    config.dia_gate_floor = getattr(args, "dia_gate_floor", 0.10)
+    config.dia_init_gate = getattr(args, "dia_init_gate", 0.50)
+    config.dia_training_stage = getattr(args, "dia_training_stage", "one_stage")
+    config.dia_stage1_ce_loss_weight = getattr(
+        args,
+        "dia_stage1_ce_loss_weight",
+        0.25,
+    )
+    config.dia_stage1_attn_loss_weight = getattr(
+        args,
+        "dia_stage1_attn_loss_weight",
+        0.25,
+    )
+    config.dia_stage1_evidence_usage_loss_weight = getattr(
+        args,
+        "dia_stage1_evidence_usage_loss_weight",
+        0.10,
+    )
+    config.dia_stage1_area_recall_loss_weight = getattr(
+        args,
+        "dia_stage1_area_recall_loss_weight",
+        0.0,
+    )
     config.dia_num_evidence_tokens = args.dia_num_evidence_tokens
     config.dia_num_heads = args.dia_num_heads
     config.dia_attn_dropout = args.dia_attn_dropout
@@ -1340,16 +3016,21 @@ def init_LISAT_model(args, model_args):
     config.attn_loss_weight = args.attn_loss_weight if args.use_dia else 0.0
     config.dia_bypass_fusion = getattr(args, "dia_bypass_fusion", False)
 
-    pretrained_output = LISATForCausalLM.from_pretrained(
-        args.version,
-        config=config,
-        torch_dtype=torch_dtype,
-        # DIA adds a scalar ReZero parameter. Transformers' meta-device loader
-        # can fail on 0-d parameters, so use the regular loader here.
-        low_cpu_mem_usage=False,
-        output_loading_info=True,
-        **model_args
-    )
+    previous_transformers_verbosity = transformers.logging.get_verbosity()
+    transformers.logging.set_verbosity_error()
+    try:
+        pretrained_output = LISATForCausalLM.from_pretrained(
+            args.version,
+            config=config,
+            torch_dtype=torch_dtype,
+            # DIA adds a scalar ReZero parameter. Transformers' meta-device loader
+            # can fail on 0-d parameters, so use the regular loader here.
+            low_cpu_mem_usage=False,
+            output_loading_info=True,
+            **model_args
+        )
+    finally:
+        transformers.logging.set_verbosity(previous_transformers_verbosity)
     if isinstance(pretrained_output, tuple):
         model, loading_info = pretrained_output
     else:
@@ -1424,6 +3105,12 @@ def init_LISAT_model(args, model_args):
                         "evidence_fusion",
                         "explicit_token_bridge",
                         "dense_evidence_prompt",
+                        "explicit_role_adapter",
+                        "bounded_dense_evidence_prompt",
+                        "faithful_evidence_fusion",
+                        "latent_sparse_fusion",
+                        "latent_dense_evidence_prompt",
+                        "evidence_visual_bottleneck",
                     ]
                 )
             for name, module in model.named_modules():
@@ -1446,26 +3133,83 @@ def init_LISAT_model(args, model_args):
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    # Make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
-    trainable_parts = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+    dia_parts = (
+        "con_hidden_fcs",
+        "context_adapter",
+        "evidence_fusion",
+        "explicit_token_bridge",
+        "dense_evidence_prompt",
+        "explicit_role_adapter",
+        "bounded_dense_evidence_prompt",
+        "faithful_evidence_fusion",
+        "latent_sparse_fusion",
+        "latent_dense_evidence_prompt",
+        "evidence_visual_bottleneck",
+    )
+    managed_trainable_parts = (
+        "lm_head",
+        "embed_tokens",
+        "mask_decoder",
+        "text_hidden_fcs",
+        *dia_parts,
+    )
+
+    # Stage 1 is an evidence-only warmup: [CON] and attention learn to find
+    # visual evidence while the original [SEG] decoding path stays fixed.
+    stage = getattr(args, "dia_training_stage", "one_stage")
+    fusion_mode = getattr(args, "dia_fusion_mode", "legacy")
+    if (
+        args.use_dia
+        and fusion_mode == "latent_sparse_dense_dia"
+        and stage == "evidence"
+    ):
+        trainable_parts = [
+            "lm_head",
+            "embed_tokens",
+            "con_hidden_fcs",
+            "context_adapter",
+        ]
+        if getattr(args, "visual_bottleneck_enabled", False):
+            trainable_parts.append("evidence_visual_bottleneck")
+    else:
+        trainable_parts = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+
     if args.use_dia:
         trainable_parts.extend(["con_hidden_fcs", "context_adapter"])
-        if getattr(args, "dia_fusion_mode", "legacy") == "legacy":
-            trainable_parts.append("evidence_fusion")
-        else:
-            trainable_parts.extend(["explicit_token_bridge", "dense_evidence_prompt"])
+        if not (
+            fusion_mode == "latent_sparse_dense_dia"
+            and stage == "evidence"
+        ):
+            if fusion_mode == "legacy":
+                trainable_parts.append("evidence_fusion")
+            elif fusion_mode == "evidence_feedback":
+                trainable_parts.append("evidence_fusion")
+            elif fusion_mode == "faithful_evidence_fusion":
+                trainable_parts.append("faithful_evidence_fusion")
+            elif fusion_mode == "sparse_dense":
+                trainable_parts.extend(["explicit_token_bridge", "dense_evidence_prompt"])
+            elif fusion_mode == "bounded_sparse_dense":
+                trainable_parts.extend(
+                    ["explicit_role_adapter", "bounded_dense_evidence_prompt"]
+                )
+            elif fusion_mode == "latent_sparse_dense_dia":
+                trainable_parts.extend(
+                    ["latent_sparse_fusion", "latent_dense_evidence_prompt"]
+                )
+                if getattr(args, "visual_bottleneck_enabled", False):
+                    trainable_parts.append("evidence_visual_bottleneck")
+            else:
+                raise ValueError(f"Unsupported DIA fusion mode: {fusion_mode}")
+
+    for n, p in model.named_parameters():
+        if any(part in n for part in managed_trainable_parts):
+            p.requires_grad = False
+
     for n, p in model.named_parameters():
         if any(part in n for part in trainable_parts):
             p.requires_grad = True
 
     if getattr(args, "local_rank", 0) == 0:
-        dia_parts = (
-            "con_hidden_fcs",
-            "context_adapter",
-            "evidence_fusion",
-            "explicit_token_bridge",
-            "dense_evidence_prompt",
-        )
         core_trainable_params = 0
         dia_trainable_params = 0
         for name, param in model.named_parameters():
@@ -1477,6 +3221,8 @@ def init_LISAT_model(args, model_args):
                 core_trainable_params += param.numel()
         print(
             "[Trainable] "
+            f"dia_training_stage={stage}, "
+            f"selected_parts={sorted(set(trainable_parts))}, "
             f"core_trainable_params={core_trainable_params}, "
             f"dia_trainable_params={dia_trainable_params}"
         )

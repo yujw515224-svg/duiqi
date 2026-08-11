@@ -59,6 +59,7 @@ except ImportError:
 METRIC_FIELDS = [
     "timestamp",
     "phase",
+    "dia_training_stage",
     "epoch",
     "step",
     "split",
@@ -69,11 +70,18 @@ METRIC_FIELDS = [
     "mask_loss",
     "attn_alignment_loss",
     "attn_loss",
+    "evidence_map_loss",
+    "anchor_loss",
+    "anchor_loss_weight",
     "num_positive_masks",
     "num_valid_attn_masks",
+    "num_valid_evidence_masks",
     "res_scale",
     "gate_mean",
     "attention_entropy",
+    "map_prob_mean",
+    "map_prob_max",
+    "fusion_strength",
     "explicit_con_count",
     "explicit_seg_count",
     "explicit_pair_rate",
@@ -81,6 +89,46 @@ METRIC_FIELDS = [
     "token_gate_mean",
     "token_delta_ratio",
     "dense_delta_ratio",
+    "role_preclip_ratio",
+    "role_delta_ratio",
+    "role_bound_scale",
+    "role_bound_hit_rate",
+    "bounded_dense_preclip_ratio",
+    "bounded_dense_delta_ratio",
+    "bounded_dense_bound_scale",
+    "bounded_dense_bound_hit_rate",
+    "dense_confidence",
+    "dense_normalized_entropy",
+    "dense_relative_attention_abs_mean",
+    "faithful_raw_delta_ratio",
+    "evidence_delta_ratio",
+    "faithful_smooth_scale",
+    "latent_sparse_raw_delta_ratio",
+    "latent_sparse_delta_ratio",
+    "latent_sparse_bound_scale",
+    "latent_sparse_bound_hit_rate",
+    "latent_dense_preclip_ratio",
+    "latent_dense_delta_ratio",
+    "latent_dense_bound_scale",
+    "latent_dense_bound_hit_rate",
+    "latent_dense_confidence",
+    "visual_bottleneck_gate_mean",
+    "visual_bottleneck_confidence",
+    "visual_bottleneck_image_delta_ratio",
+    "visual_bottleneck_residual_ratio",
+    "visual_bottleneck_total_delta_ratio",
+    "visual_bottleneck_bound_scale",
+    "visual_bottleneck_bound_hit_rate",
+    "evidence_usage_loss",
+    "area_recall_loss",
+    "latent_con_count",
+    "attention_normalized_entropy",
+    "explicit_paired_count",
+    "explicit_orphan_con_count",
+    "explicit_orphan_seg_count",
+    "explicit_invalid_row_count",
+    "sam_prompt_encoder_calls",
+    "sam_mask_decoder_calls",
     "valid_attention_entropy",
     "lr",
     "val_giou",
@@ -102,6 +150,7 @@ METRIC_FIELDS = [
     "val_pr_90",
     "val_gt_fg_frac",
     "val_pred_fg_frac",
+    "val_pred_gt_fg_ratio",
     "val_empty_gt_rate",
     "val_empty_pred_rate",
     "val_logit_mean",
@@ -197,6 +246,72 @@ def _check_resume_mode_compatibility(args):
                 f"use_dia={saved_use_dia}, but current run has "
                 f"use_dia={args.use_dia}."
             )
+        structural_comparisons = {
+            "dia_fusion_mode": str,
+            "explicit_con_in_conversation": bool,
+            "dia_num_evidence_tokens": int,
+            "dia_num_heads": int,
+            "faithful_fusion_hidden_dim": int,
+            "latent_sparse_hidden_dim": int,
+            "visual_bottleneck_enabled": bool,
+            "anchor_decay_steps": int,
+        }
+        tunable_comparisons = {
+            "faithful_max_delta_ratio": float,
+            "faithful_delta_gain": float,
+            "attn_loss_weight": float,
+            "latent_sparse_max_delta_ratio": float,
+            "latent_sparse_delta_gain": float,
+            "latent_sparse_init_std": float,
+            "latent_dense_max_delta_ratio": float,
+            "latent_dense_init_std": float,
+            "evidence_usage_loss_weight": float,
+            "evidence_target_delta_ratio": float,
+            "area_recall_loss_weight": float,
+            "visual_bottleneck_beta": float,
+            "visual_bottleneck_attn_clip": float,
+            "visual_bottleneck_max_delta_ratio": float,
+            "visual_bottleneck_confidence_power": float,
+            "visual_bottleneck_init_std": float,
+            "map_loss_weight": float,
+            "anchor_loss_weight": float,
+            "dia_loc_bias_init": float,
+            "dia_fusion_max_strength": float,
+            "dia_fusion_warmup_steps": float,
+            "dia_fusion_ramp_steps": float,
+            "dia_gate_floor": float,
+            "dia_init_gate": float,
+        }
+        comparisons = {
+            **structural_comparisons,
+            **tunable_comparisons,
+        }
+        for key, caster in comparisons.items():
+            if key not in saved_args:
+                continue
+            saved_value = caster(saved_args[key])
+            current_value = caster(getattr(args, key))
+            if caster is float:
+                mismatch = abs(saved_value - current_value) > 1e-12
+            else:
+                mismatch = saved_value != current_value
+            if mismatch:
+                if (
+                    key in tunable_comparisons
+                    and getattr(args, "allow_resume_hparam_mismatch", False)
+                ):
+                    if getattr(args, "local_rank", 0) == 0:
+                        print(
+                            "[Resume][WARN] Continuing from checkpoint with "
+                            f"changed tunable DIA hparam {key}: "
+                            f"saved={saved_value}, current={current_value}."
+                        )
+                    continue
+                raise RuntimeError(
+                    "Resume mode mismatch: checkpoint was created with "
+                    f"{key}={saved_value}, but current run has "
+                    f"{key}={current_value}."
+                )
         return
 
 
@@ -218,6 +333,30 @@ def append_metrics(args, metrics):
         if write_header:
             writer.writeheader()
         writer.writerow({field: record.get(field, "") for field in METRIC_FIELDS})
+
+
+def build_optimizer_param_groups(model, base_lr, dia_lr_multiplier):
+    dia_keywords = (
+        "con_hidden_fcs",
+        "context_adapter",
+        "evidence_fusion",
+    )
+    base_params = []
+    dia_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(keyword in name for keyword in dia_keywords):
+            dia_params.append(param)
+        else:
+            base_params.append(param)
+
+    groups = []
+    if base_params:
+        groups.append({"params": base_params, "lr": base_lr})
+    if dia_params:
+        groups.append({"params": dia_params, "lr": base_lr * dia_lr_multiplier})
+    return groups
 
 
 def _distributed_barrier():
@@ -488,6 +627,15 @@ def parse_args(args):
     parser.add_argument("--no_eval", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--resume", default="")
+    parser.add_argument(
+        "--resume_model_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Load only model weights from --resume. Use this when switching "
+            "between DIA stages because the trainable parameter set changes."
+        ),
+    )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument(
         "--auto_resume",
@@ -536,10 +684,105 @@ def parse_args(args):
         "--dia_fusion_mode",
         type=str,
         default="legacy",
-        choices=["legacy", "sparse_dense"],
+        choices=[
+            "legacy",
+            "faithful_evidence_fusion",
+            "sparse_dense",
+            "bounded_sparse_dense",
+            "latent_sparse_dense_dia",
+            "evidence_feedback",
+        ],
     )
     parser.add_argument("--token_bridge_init_gate", type=float, default=0.02)
     parser.add_argument("--dense_attn_clip", type=float, default=8.0)
+    parser.add_argument("--role_adapter_hidden_dim", type=int, default=256)
+    parser.add_argument("--role_max_delta_ratio", type=float, default=0.05)
+    parser.add_argument("--dense_max_delta_ratio", type=float, default=0.10)
+    parser.add_argument("--dense_confidence_power", type=float, default=0.5)
+    parser.add_argument("--faithful_fusion_hidden_dim", type=int, default=256)
+    parser.add_argument("--faithful_max_delta_ratio", type=float, default=0.15)
+    parser.add_argument("--faithful_delta_gain", type=float, default=1.0)
+    parser.add_argument("--latent_sparse_hidden_dim", type=int, default=256)
+    parser.add_argument("--latent_sparse_max_delta_ratio", type=float, default=0.40)
+    parser.add_argument("--latent_sparse_delta_gain", type=float, default=3.0)
+    parser.add_argument("--latent_sparse_init_std", type=float, default=1e-3)
+    parser.add_argument("--latent_dense_max_delta_ratio", type=float, default=0.15)
+    parser.add_argument("--latent_dense_init_std", type=float, default=1e-3)
+    parser.add_argument(
+        "--visual_bottleneck_enabled",
+        dest="visual_bottleneck_enabled",
+        action="store_true",
+        default=False,
+        help="Enable CON-attention visual feature bottleneck before SAM mask decoder.",
+    )
+    parser.add_argument(
+        "--no_visual_bottleneck",
+        dest="visual_bottleneck_enabled",
+        action="store_false",
+        help="Disable the CON-attention visual feature bottleneck.",
+    )
+    parser.add_argument("--visual_bottleneck_beta", type=float, default=0.30)
+    parser.add_argument("--visual_bottleneck_attn_clip", type=float, default=8.0)
+    parser.add_argument(
+        "--visual_bottleneck_max_delta_ratio",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument(
+        "--visual_bottleneck_confidence_power",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument("--visual_bottleneck_init_std", type=float, default=1e-3)
+    parser.add_argument("--evidence_usage_loss_weight", type=float, default=0.10)
+    parser.add_argument("--evidence_target_delta_ratio", type=float, default=0.12)
+    parser.add_argument("--area_recall_loss_weight", type=float, default=0.20)
+    parser.add_argument("--map_loss_weight", type=float, default=0.10)
+    parser.add_argument("--anchor_loss_weight", type=float, default=0.10)
+    parser.add_argument("--anchor_decay_steps", type=int, default=8000)
+    parser.add_argument("--dia_loc_bias_init", type=float, default=-4.0)
+    parser.add_argument("--dia_fusion_max_strength", type=float, default=0.15)
+    parser.add_argument("--dia_fusion_warmup_steps", type=int, default=2000)
+    parser.add_argument("--dia_fusion_ramp_steps", type=int, default=4000)
+    parser.add_argument("--dia_gate_floor", type=float, default=0.10)
+    parser.add_argument("--dia_init_gate", type=float, default=0.50)
+    parser.add_argument("--dia_lr_multiplier", type=float, default=2.0)
+    parser.add_argument(
+        "--dia_training_stage",
+        choices=["one_stage", "evidence", "fusion"],
+        default="one_stage",
+        help=(
+            "one_stage keeps the existing DIA recipe. evidence trains CON "
+            "attention/evidence first. fusion trains full DIA decoding after "
+            "an evidence-stage checkpoint."
+        ),
+    )
+    parser.add_argument("--dia_stage1_ce_loss_weight", type=float, default=0.25)
+    parser.add_argument("--dia_stage1_attn_loss_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--dia_stage1_evidence_usage_loss_weight",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument("--dia_stage1_area_recall_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--faithful_strict_config",
+        action="store_true",
+        default=False,
+        help=(
+            "Require the conservative faithful DIA recipe "
+            "(attn_loss_weight=0.02, max_delta_ratio=0.15, delta_gain=1.0)."
+        ),
+    )
+    parser.add_argument(
+        "--allow_resume_hparam_mismatch",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow resuming a DIA checkpoint while changing tunable strength "
+            "hparams such as attention loss weight, residual cap, or delta gain."
+        ),
+    )
     parser.add_argument(
         "--dia_bypass_fusion",
         action="store_true",
@@ -566,20 +809,175 @@ def main(args):
         raise ValueError("--explicit_con_in_conversation requires --use_dia.")
     if args.explicit_con_in_conversation and not args.init_con_from_seg:
         raise ValueError("--explicit_con_in_conversation requires --init_con_from_seg.")
-    if args.dia_fusion_mode == "sparse_dense":
+    if args.dia_training_stage != "one_stage":
         if not args.use_dia:
-            raise ValueError("sparse_dense requires --use_dia.")
+            raise ValueError("--dia_training_stage requires --use_dia.")
+        if args.dia_fusion_mode != "latent_sparse_dense_dia":
+            raise ValueError(
+                "Two-stage DIA is only defined for latent_sparse_dense_dia."
+            )
+    if args.dia_training_stage == "fusion" and args.resume and not args.resume_model_only:
+        if args.local_rank == 0:
+            print(
+                "[WARN] dia_training_stage=fusion usually should use "
+                "--resume_model_only when loading an evidence-stage checkpoint."
+            )
+    for name in (
+        "dia_stage1_ce_loss_weight",
+        "dia_stage1_attn_loss_weight",
+        "dia_stage1_evidence_usage_loss_weight",
+        "dia_stage1_area_recall_loss_weight",
+    ):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"{name} must be non-negative.")
+    explicit_dia_modes = {
+        "sparse_dense",
+        "bounded_sparse_dense",
+        "faithful_evidence_fusion",
+        "evidence_feedback",
+    }
+    if args.dia_fusion_mode in explicit_dia_modes:
+        if not args.use_dia:
+            raise ValueError(f"{args.dia_fusion_mode} requires --use_dia.")
         if not args.explicit_con_in_conversation:
             raise ValueError(
-                "sparse_dense requires --explicit_con_in_conversation."
+                f"{args.dia_fusion_mode} requires --explicit_con_in_conversation."
             )
         if args.dia_bypass_fusion:
-            raise ValueError("--dia_bypass_fusion is incompatible with sparse_dense.")
+            raise ValueError(
+                f"--dia_bypass_fusion is incompatible with {args.dia_fusion_mode}."
+            )
+    if args.dia_fusion_mode == "evidence_feedback":
+        if not args.init_con_from_seg:
+            raise ValueError("evidence_feedback requires --init_con_from_seg.")
+        if args.dia_num_evidence_tokens != 1:
+            raise ValueError("evidence_feedback requires --dia_num_evidence_tokens 1.")
+        if args.dia_num_heads != 8:
+            raise ValueError("evidence_feedback requires --dia_num_heads 8.")
+        if abs(float(args.dia_attn_dropout)) > 1e-12:
+            raise ValueError("evidence_feedback requires --dia_attn_dropout 0.0.")
+        for name in (
+            "map_loss_weight",
+            "anchor_loss_weight",
+            "dia_fusion_max_strength",
+            "dia_gate_floor",
+            "dia_init_gate",
+            "dia_lr_multiplier",
+        ):
+            if getattr(args, name) < 0.0:
+                raise ValueError(f"{name} must be non-negative.")
+        if not 0.0 < args.dia_fusion_max_strength <= 1.0:
+            raise ValueError("dia_fusion_max_strength must be in (0, 1].")
+        if args.dia_lr_multiplier <= 0.0:
+            raise ValueError("dia_lr_multiplier must be positive.")
+        if args.anchor_decay_steps < 0:
+            raise ValueError("anchor_decay_steps must be non-negative.")
+        if args.dia_fusion_warmup_steps < 0 or args.dia_fusion_ramp_steps <= 0:
+            raise ValueError(
+                "dia_fusion_warmup_steps must be >= 0 and "
+                "dia_fusion_ramp_steps must be > 0."
+            )
+        if not 0.0 <= args.dia_gate_floor < args.dia_init_gate < 1.0:
+            raise ValueError("expected 0 <= dia_gate_floor < dia_init_gate < 1.")
+    if args.dia_fusion_mode == "faithful_evidence_fusion":
+        if not args.init_con_from_seg:
+            raise ValueError("faithful_evidence_fusion requires --init_con_from_seg.")
+        if args.dia_num_evidence_tokens != 1:
+            raise ValueError("faithful_evidence_fusion requires --dia_num_evidence_tokens 1.")
+        if args.dia_num_heads != 8:
+            raise ValueError("faithful_evidence_fusion requires --dia_num_heads 8.")
+        if abs(float(args.dia_attn_dropout)) > 1e-12:
+            raise ValueError("faithful_evidence_fusion requires --dia_attn_dropout 0.0.")
+        if abs(float(args.fusion_dropout)) > 1e-12:
+            raise ValueError("faithful_evidence_fusion requires --fusion_dropout 0.0.")
+        if args.faithful_fusion_hidden_dim <= 0:
+            raise ValueError("faithful_fusion_hidden_dim must be positive.")
+        if args.faithful_max_delta_ratio <= 0.0:
+            raise ValueError("faithful_max_delta_ratio must be positive.")
+        if args.faithful_delta_gain <= 0.0:
+            raise ValueError("faithful_delta_gain must be positive.")
+        if args.faithful_strict_config:
+            if abs(float(args.attn_loss_weight) - 0.02) > 1e-12:
+                raise ValueError(
+                    "strict faithful_evidence_fusion requires --attn_loss_weight 0.02."
+                )
+            if abs(float(args.faithful_max_delta_ratio) - 0.15) > 1e-12:
+                raise ValueError(
+                    "strict faithful_evidence_fusion requires "
+                    "--faithful_max_delta_ratio 0.15."
+                )
+            if abs(float(args.faithful_delta_gain) - 1.0) > 1e-12:
+                raise ValueError(
+                    "strict faithful_evidence_fusion requires "
+                    "--faithful_delta_gain 1.0."
+                )
+    if args.dia_fusion_mode == "sparse_dense":
         if not 0.0 < args.token_bridge_init_gate < 0.1:
             raise ValueError(
                 "token_bridge_init_gate must be in (0, 0.1) for the "
                 "baseline-anchored Explicit DIA experiment."
             )
+    if args.dia_fusion_mode == "bounded_sparse_dense":
+        if args.role_adapter_hidden_dim <= 0:
+            raise ValueError("role_adapter_hidden_dim must be positive.")
+        if not 0.0 < args.role_max_delta_ratio <= 0.10:
+            raise ValueError("role_max_delta_ratio must be in (0, 0.10].")
+        if not 0.0 < args.dense_max_delta_ratio <= 0.20:
+            raise ValueError("dense_max_delta_ratio must be in (0, 0.20].")
+        if args.dense_confidence_power <= 0.0:
+            raise ValueError("dense_confidence_power must be positive.")
+    if args.dia_fusion_mode == "latent_sparse_dense_dia":
+        if not args.use_dia:
+            raise ValueError("latent_sparse_dense_dia requires --use_dia.")
+        if args.explicit_con_in_conversation:
+            raise ValueError(
+                "latent_sparse_dense_dia uses latent CON from [SEG] hidden; "
+                "do not pass --explicit_con_in_conversation."
+            )
+        if args.dia_bypass_fusion:
+            raise ValueError(
+                "--dia_bypass_fusion is incompatible with latent_sparse_dense_dia."
+            )
+        if args.dia_num_evidence_tokens < 2:
+            raise ValueError("latent_sparse_dense_dia requires --dia_num_evidence_tokens >= 2.")
+        if args.dia_num_heads != 8:
+            raise ValueError("latent_sparse_dense_dia requires --dia_num_heads 8.")
+        if abs(float(args.dia_attn_dropout)) > 1e-12:
+            raise ValueError("latent_sparse_dense_dia requires --dia_attn_dropout 0.0.")
+        if args.latent_sparse_hidden_dim <= 0:
+            raise ValueError("latent_sparse_hidden_dim must be positive.")
+        if not 0.0 < args.latent_sparse_max_delta_ratio <= 0.60:
+            raise ValueError("latent_sparse_max_delta_ratio must be in (0, 0.60].")
+        if args.latent_sparse_delta_gain <= 0.0:
+            raise ValueError("latent_sparse_delta_gain must be positive.")
+        if args.latent_sparse_init_std < 0.0:
+            raise ValueError("latent_sparse_init_std must be non-negative.")
+        if not 0.0 < args.latent_dense_max_delta_ratio <= 0.20:
+            raise ValueError("latent_dense_max_delta_ratio must be in (0, 0.20].")
+        if args.latent_dense_init_std < 0.0:
+            raise ValueError("latent_dense_init_std must be non-negative.")
+        if args.visual_bottleneck_enabled:
+            if not 0.0 < args.visual_bottleneck_beta <= 1.0:
+                raise ValueError("visual_bottleneck_beta must be in (0, 1].")
+            if args.visual_bottleneck_attn_clip <= 1.0:
+                raise ValueError("visual_bottleneck_attn_clip must be > 1.")
+            if not 0.0 < args.visual_bottleneck_max_delta_ratio <= 0.50:
+                raise ValueError(
+                    "visual_bottleneck_max_delta_ratio must be in (0, 0.50]."
+                )
+            if args.visual_bottleneck_confidence_power <= 0.0:
+                raise ValueError("visual_bottleneck_confidence_power must be positive.")
+            if args.visual_bottleneck_init_std < 0.0:
+                raise ValueError("visual_bottleneck_init_std must be non-negative.")
+        if args.evidence_usage_loss_weight < 0.0:
+            raise ValueError("evidence_usage_loss_weight must be non-negative.")
+        if not 0.0 <= args.evidence_target_delta_ratio <= args.latent_sparse_max_delta_ratio:
+            raise ValueError(
+                "evidence_target_delta_ratio must be between 0 and "
+                "latent_sparse_max_delta_ratio."
+            )
+        if args.area_recall_loss_weight < 0.0:
+            raise ValueError("area_recall_loss_weight must be non-negative.")
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
 
     if args.local_rank == 0:
@@ -590,40 +988,34 @@ def main(args):
             "[Startup] "
             f"starting_from={args.version}, "
             f"manual_resume={args.resume or None}, "
-            f"auto_resume={args.auto_resume}"
-        )
-        dia_con_source = None
-        if args.use_dia:
-            dia_con_source = (
-                "explicit_sparse_dense_anchor"
-                if args.dia_fusion_mode == "sparse_dense"
-                else (
-                    "explicit_con_seg_dual_hidden"
-                    if args.explicit_con_in_conversation
-                    else "seg_hidden_dual_projector"
-                )
-            )
-        print(
-            "[Mode] "
-            f"use_dia={args.use_dia}, "
-            f"dia_con_source={dia_con_source}, "
-            f"explicit_con_in_conversation={args.explicit_con_in_conversation}"
+            f"auto_resume={args.auto_resume}, "
+            f"resume_model_only={args.resume_model_only}"
         )
         print(
             "[DIA] "
+            f"enabled={args.use_dia}, "
+            f"mode={args.dia_fusion_mode}, "
+            f"stage={args.dia_training_stage}, "
+            f"explicit_con={args.explicit_con_in_conversation}, "
             f"K={args.dia_num_evidence_tokens}, "
             f"heads={args.dia_num_heads}, "
-            f"attention_dropout={args.dia_attn_dropout}, "
-            f"fusion_dropout={args.fusion_dropout}, "
-            f"attention_loss_weight={args.attn_loss_weight}, "
-            f"init_con_from_seg={args.init_con_from_seg}, "
-            f"dia_bypass_fusion={args.dia_bypass_fusion}"
-        )
-        print(
-            "[DIA-Architecture] "
-            f"fusion_mode={args.dia_fusion_mode}, "
-            f"token_bridge_init_gate={args.token_bridge_init_gate}, "
-            f"dense_attn_clip={args.dense_attn_clip}"
+            f"attn_dropout={args.dia_attn_dropout}, "
+            f"attn_loss={args.attn_loss_weight}, "
+            f"latent_sparse_cap={args.latent_sparse_max_delta_ratio}, "
+            f"latent_sparse_gain={args.latent_sparse_delta_gain}, "
+            f"latent_dense_cap={args.latent_dense_max_delta_ratio}, "
+            f"veb={args.visual_bottleneck_enabled}, "
+            f"veb_beta={args.visual_bottleneck_beta}, "
+            f"veb_cap={args.visual_bottleneck_max_delta_ratio}, "
+            f"veb_conf_power={args.visual_bottleneck_confidence_power}, "
+            f"map_loss={args.map_loss_weight}, "
+            f"anchor_loss={args.anchor_loss_weight}, "
+            f"anchor_decay={args.anchor_decay_steps}, "
+            f"loc_bias={args.dia_loc_bias_init}, "
+            f"fusion_strength={args.dia_fusion_max_strength}, "
+            f"fusion_warmup={args.dia_fusion_warmup_steps}, "
+            f"fusion_ramp={args.dia_fusion_ramp_steps}, "
+            f"dia_lr_multiplier={args.dia_lr_multiplier}"
         )
 
     # ---- Init conversation template ----
@@ -650,6 +1042,55 @@ def main(args):
         "dia_fusion_mode": args.dia_fusion_mode,
         "token_bridge_init_gate": args.token_bridge_init_gate,
         "dense_attn_clip": args.dense_attn_clip,
+        "role_adapter_hidden_dim": args.role_adapter_hidden_dim,
+        "role_max_delta_ratio": args.role_max_delta_ratio,
+        "dense_max_delta_ratio": args.dense_max_delta_ratio,
+        "dense_confidence_power": args.dense_confidence_power,
+        "faithful_fusion_hidden_dim": args.faithful_fusion_hidden_dim,
+        "faithful_max_delta_ratio": args.faithful_max_delta_ratio,
+        "faithful_delta_gain": args.faithful_delta_gain,
+        "faithful_strict_config": args.faithful_strict_config,
+        "latent_sparse_hidden_dim": args.latent_sparse_hidden_dim,
+        "latent_sparse_max_delta_ratio": args.latent_sparse_max_delta_ratio,
+        "latent_sparse_delta_gain": args.latent_sparse_delta_gain,
+        "latent_sparse_init_std": args.latent_sparse_init_std,
+        "latent_dense_max_delta_ratio": args.latent_dense_max_delta_ratio,
+        "latent_dense_init_std": args.latent_dense_init_std,
+        "visual_bottleneck_enabled": args.visual_bottleneck_enabled,
+        "visual_bottleneck_beta": args.visual_bottleneck_beta,
+        "visual_bottleneck_attn_clip": args.visual_bottleneck_attn_clip,
+        "visual_bottleneck_max_delta_ratio": (
+            args.visual_bottleneck_max_delta_ratio
+        ),
+        "visual_bottleneck_confidence_power": (
+            args.visual_bottleneck_confidence_power
+        ),
+        "visual_bottleneck_init_std": args.visual_bottleneck_init_std,
+        "evidence_usage_loss_weight": (
+            args.evidence_usage_loss_weight if args.use_dia else 0.0
+        ),
+        "evidence_target_delta_ratio": args.evidence_target_delta_ratio,
+        "area_recall_loss_weight": (
+            args.area_recall_loss_weight if args.use_dia else 0.0
+        ),
+        "map_loss_weight": args.map_loss_weight if args.use_dia else 0.0,
+        "anchor_loss_weight": args.anchor_loss_weight if args.use_dia else 0.0,
+        "anchor_decay_steps": args.anchor_decay_steps,
+        "dia_loc_bias_init": args.dia_loc_bias_init,
+        "dia_fusion_max_strength": args.dia_fusion_max_strength,
+        "dia_fusion_warmup_steps": args.dia_fusion_warmup_steps,
+        "dia_fusion_ramp_steps": args.dia_fusion_ramp_steps,
+        "dia_gate_floor": args.dia_gate_floor,
+        "dia_init_gate": args.dia_init_gate,
+        "dia_training_stage": args.dia_training_stage,
+        "dia_stage1_ce_loss_weight": args.dia_stage1_ce_loss_weight,
+        "dia_stage1_attn_loss_weight": args.dia_stage1_attn_loss_weight,
+        "dia_stage1_evidence_usage_loss_weight": (
+            args.dia_stage1_evidence_usage_loss_weight
+        ),
+        "dia_stage1_area_recall_loss_weight": (
+            args.dia_stage1_area_recall_loss_weight
+        ),
 
     }
     tokenizer, model, vision_tower = init_LISAT_model(args, model_args)
@@ -767,9 +1208,35 @@ def main(args):
     if args.local_rank == 0:
         print(f"[DeepSpeed] zero_stage={args.zero_stage}, zero_bucket_size={args.zero_bucket_size}")
 
+    model_parameters = model.parameters()
+    if args.use_dia and args.dia_fusion_mode == "evidence_feedback":
+        model_parameters = build_optimizer_param_groups(
+            model,
+            args.lr,
+            args.dia_lr_multiplier,
+        )
+        if len(model_parameters) == 2:
+            ds_config["scheduler"]["params"]["warmup_min_lr"] = [0.0, 0.0]
+            ds_config["scheduler"]["params"]["warmup_max_lr"] = [
+                args.lr,
+                args.lr * args.dia_lr_multiplier,
+            ]
+        if args.local_rank == 0:
+            group_lrs = [group["lr"] for group in model_parameters]
+            group_sizes = [
+                sum(param.numel() for param in group["params"])
+                for group in model_parameters
+            ]
+            print(
+                "[OptimizerGroups] "
+                f"count={len(model_parameters)}, "
+                f"lrs={group_lrs}, "
+                f"sizes={group_sizes}"
+            )
+
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
-        model_parameters=model.parameters(),
+        model_parameters=model_parameters,
         training_data=train_dataset,
         collate_fn=partial(
             collate_fn_train,
@@ -793,16 +1260,40 @@ def main(args):
     elif args.local_rank == 0:
         print(
             "[Resume] "
-            f"auto_resume={args.auto_resume}, manual_resume={args.resume or None}"
+            f"auto_resume={args.auto_resume}, manual_resume={args.resume or None}, "
+            f"model_only={args.resume_model_only}"
         )
 
     if args.resume:
         _check_resume_mode_compatibility(args)
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        print(f"[Resume] loaded_checkpoint={load_path}, start_epoch={args.start_epoch}")
+        if args.resume_model_only:
+            load_kwargs = {
+                "load_optimizer_states": False,
+                "load_lr_scheduler_states": False,
+                "load_module_only": True,
+            }
+            try:
+                load_path, client_state = model_engine.load_checkpoint(
+                    args.resume,
+                    **load_kwargs,
+                )
+            except TypeError:
+                load_kwargs.pop("load_module_only", None)
+                load_path, client_state = model_engine.load_checkpoint(
+                    args.resume,
+                    **load_kwargs,
+                )
+            if args.local_rank == 0:
+                print(
+                    "[Resume] loaded model weights only from "
+                    f"{load_path}; start_epoch remains {args.start_epoch}."
+                )
+        else:
+            load_path, client_state = model_engine.load_checkpoint(args.resume)
+            with open(os.path.join(args.resume, "latest"), "r") as f:
+                ckpt_dir = f.readlines()[0].strip()
+            args.start_epoch = int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
+            print(f"[Resume] loaded_checkpoint={load_path}, start_epoch={args.start_epoch}")
 
     # ---- Validation DataLoader ----
     if val_dataset is not None:
@@ -840,6 +1331,7 @@ def main(args):
         if args.eval_dataset == "refsegrs":
             metrics_record = {
                 "phase": "eval_only",
+                "dia_training_stage": args.dia_training_stage,
                 "step": 0,
                 "split": args.eval_split,
             }
@@ -902,6 +1394,7 @@ def main(args):
 
         metrics_record = {
             "phase": "eval_only",
+            "dia_training_stage": args.dia_training_stage,
             "step": 0,
             "split": args.eval_dataset,
             "nwpu_bleu4": nwpu_bleu4,
@@ -1007,6 +1500,7 @@ def main(args):
 
             metrics_record = {
                 "phase": "val",
+                "dia_training_stage": args.dia_training_stage,
                 "epoch": epoch,
                 "step": global_iters,
                 "split": args.eval_split if args.eval_dataset == "refsegrs" else args.eval_dataset,
@@ -1051,37 +1545,6 @@ def main(args):
         model_engine.save_checkpoint(save_dir)
 
 
-def _grad_norm_by_keywords(model, keywords):
-    module = getattr(model, "module", model)
-    total_sq = 0.0
-    for name, param in module.named_parameters():
-        if not any(keyword in name for keyword in keywords):
-            continue
-        grad = param.grad
-        if grad is None:
-            continue
-        total_sq += grad.detach().float().norm().item() ** 2
-    return total_sq ** 0.5
-
-
-def _print_early_grad_diagnostics(model, global_step, args):
-    if getattr(args, "local_rank", 0) != 0 or global_step >= 20 or global_step % 10 != 0:
-        return
-    diagnostics = {
-        "grad_text_hidden_fcs": ["text_hidden_fcs"],
-        "grad_con_hidden_fcs": ["con_hidden_fcs"],
-        "grad_context_adapter": ["context_adapter"],
-        "grad_explicit_token_bridge": ["explicit_token_bridge"],
-        "grad_dense_evidence_out_proj": ["dense_evidence_prompt.out_proj"],
-        "grad_mask_decoder": ["mask_decoder"],
-    }
-    message = "[GradDiag] " + ", ".join(
-        f"{name}={_grad_norm_by_keywords(model, keywords):.4e}"
-        for name, keywords in diagnostics.items()
-    )
-    print(message)
-
-
 def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     """Main training loop (one epoch)."""
     keys = [
@@ -1091,20 +1554,44 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
         "mask_dice_loss",
         "mask_loss",
         "attn_alignment_loss",
+        "evidence_map_loss",
+        "anchor_loss",
+        "anchor_loss_weight",
         "num_positive_masks",
         "num_valid_attn_masks",
-        "res_scale",
-        "gate_mean",
+        "num_valid_evidence_masks",
         "attention_entropy",
-        "explicit_con_count",
-        "explicit_seg_count",
-        "explicit_pair_rate",
-        "explicit_hidden_cosine",
-        "token_gate_mean",
-        "token_delta_ratio",
-        "dense_delta_ratio",
-        "valid_attention_entropy",
+        "attention_normalized_entropy",
     ]
+    if args.use_dia and args.dia_fusion_mode == "latent_sparse_dense_dia":
+        keys.extend(
+            [
+                "latent_sparse_delta_ratio",
+                "latent_dense_delta_ratio",
+                "latent_dense_confidence",
+                "visual_bottleneck_gate_mean",
+                "visual_bottleneck_confidence",
+                "visual_bottleneck_total_delta_ratio",
+                "evidence_usage_loss",
+                "area_recall_loss",
+                "latent_con_count",
+            ]
+        )
+    elif args.use_dia and args.dia_fusion_mode == "legacy":
+        keys.extend(["res_scale", "gate_mean"])
+    elif args.use_dia and args.dia_fusion_mode == "faithful_evidence_fusion":
+        keys.extend(["evidence_delta_ratio", "faithful_smooth_scale"])
+    elif args.use_dia and args.dia_fusion_mode == "evidence_feedback":
+        keys.extend(
+            [
+                "map_prob_mean",
+                "map_prob_max",
+                "fusion_strength",
+                "evidence_delta_ratio",
+            ]
+        )
+    elif args.use_dia:
+        keys.extend(["token_delta_ratio", "bounded_dense_delta_ratio", "dense_confidence"])
     loss_meters = {k: AverageMeter(k, ":.4f") for k in keys}
 
     progress = ProgressMeter(
@@ -1114,6 +1601,39 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     )
 
     model.train()
+    valid_attention_keys = {
+        "bounded_dense_preclip_ratio",
+        "bounded_dense_delta_ratio",
+        "bounded_dense_bound_scale",
+        "bounded_dense_bound_hit_rate",
+        "dense_confidence",
+        "dense_normalized_entropy",
+        "dense_relative_attention_abs_mean",
+        "faithful_raw_delta_ratio",
+        "evidence_delta_ratio",
+        "faithful_smooth_scale",
+        "latent_sparse_raw_delta_ratio",
+        "latent_sparse_delta_ratio",
+        "latent_sparse_bound_scale",
+        "latent_sparse_bound_hit_rate",
+        "latent_dense_preclip_ratio",
+            "latent_dense_delta_ratio",
+            "latent_dense_bound_scale",
+            "latent_dense_bound_hit_rate",
+            "latent_dense_confidence",
+            "visual_bottleneck_gate_mean",
+            "visual_bottleneck_confidence",
+            "visual_bottleneck_image_delta_ratio",
+            "visual_bottleneck_residual_ratio",
+            "visual_bottleneck_total_delta_ratio",
+            "visual_bottleneck_bound_scale",
+            "visual_bottleneck_bound_hit_rate",
+            "attention_normalized_entropy",
+            "valid_attention_entropy",
+            "map_prob_mean",
+            "map_prob_max",
+            "fusion_strength",
+        }
 
     for global_step in range(args.steps_per_epoch):
         for micro_step in range(args.grad_accumulation_steps):
@@ -1124,20 +1644,22 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
                 input_dict = next(train_iter)
 
             input_dict = prepare_input(input_dict, args.precision, is_cuda=True)
-            output_dict = model(**input_dict)
+            dia_global_step = epoch * args.steps_per_epoch + global_step
+            output_dict = model(
+                dia_global_step=dia_global_step,
+                **input_dict,
+            )
 
             batch_size = input_dict["images"].size(0)
             num_valid_attn = output_dict["num_valid_attn_masks"].item()
             for k in keys:
-                if k == "valid_attention_entropy":
+                if k in valid_attention_keys:
                     if num_valid_attn > 0:
                         loss_meters[k].update(output_dict[k].item(), num_valid_attn)
                 else:
                     loss_meters[k].update(output_dict[k].item(), batch_size)
 
             model.backward(output_dict["loss"])
-            if micro_step == args.grad_accumulation_steps - 1:
-                _print_early_grad_diagnostics(model, global_step, args)
             model.step()
 
         # Log + reset
@@ -1155,6 +1677,7 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
                 wandb.log({"lr": curr_lr}, step=total_steps)
                 train_metrics = {
                     "phase": "train",
+                    "dia_training_stage": args.dia_training_stage,
                     "epoch": epoch,
                     "step": total_steps,
                     "lr": curr_lr,
@@ -1287,6 +1810,7 @@ def validate_seg(val_loader, model_engine, global_iters, args):
     recall = _safe_div(tp, target_fg)
     f1 = _safe_div(2.0 * precision * recall, precision + recall)
     pr_iou = np.asarray(pr_iou_meter.avg, dtype=np.float64)
+    pred_gt_fg_ratio = _safe_div(float(pred_fg_meter.avg), float(gt_fg_meter.avg))
 
     metrics = {
         "val_giou": giou,
@@ -1308,6 +1832,7 @@ def validate_seg(val_loader, model_engine, global_iters, args):
         "val_pr_90": float(pr_iou[4]),
         "val_gt_fg_frac": float(gt_fg_meter.avg),
         "val_pred_fg_frac": float(pred_fg_meter.avg),
+        "val_pred_gt_fg_ratio": pred_gt_fg_ratio,
         "val_empty_gt_rate": float(empty_gt_meter.avg),
         "val_empty_pred_rate": float(empty_pred_meter.avg),
         "val_logit_mean": float(logit_meter.avg),
@@ -1325,11 +1850,19 @@ def validate_seg(val_loader, model_engine, global_iters, args):
             f"pred_fg={metrics['val_pred_fg_frac']:.4f}, "
             f"gt_fg={metrics['val_gt_fg_frac']:.4f}"
         )
-        if metrics["val_pred_fg_frac"] <= 1e-8 and metrics["val_gt_fg_frac"] > 0:
+        if (
+            metrics["val_gt_fg_frac"] > 0
+            and (
+                metrics["val_pred_fg_frac"] <= 1e-8
+                or metrics["val_pred_gt_fg_ratio"] < 0.25
+                or metrics["val_pred_gt_fg_ratio"] > 4.0
+            )
+        ):
             print(
-                "[WARN] Validation predictions collapsed to all background "
-                f"at mask_threshold={args.mask_threshold}. Check training "
-                "initialization, checkpoint compatibility, and mask logits."
+                "[WARN] Validation foreground ratio is outside the stable band "
+                f"at mask_threshold={args.mask_threshold}: "
+                f"pred/gt={metrics['val_pred_gt_fg_ratio']:.4f}. "
+                "Check evidence map learning, prompt strength, and mask logits."
             )
 
     model_engine.train()
