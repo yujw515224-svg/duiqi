@@ -152,3 +152,10 @@ If you use LISAT, its datasets, or any part of this repository in your work, ple
   journal={arXiv preprint arXiv:2505.02829},
   year={2025}
 }
+```
+
+## DIA-LISA design notes
+
+- [`[SEG]` decoupling design](docs/seg_decoupling_design.md) describes a strict
+  concept/evidence/decoder separation, negative-sample routing, training stages,
+  and acceptance tests for preventing semantic shortcuts through `[SEG]`.

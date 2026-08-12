@@ -31,6 +31,7 @@ from .DIA_LISAt import (
     BoundedDenseEvidencePrompt,
     ContextEvidenceAdapter,
     DenseEvidencePrompt,
+    DecoupledMaskPrompt,
     EvidenceGuideFusion,
     EvidenceGuideFusionV2,
     EvidenceVisualBottleneck,
@@ -273,6 +274,12 @@ class LisatMetaModel(nn.Module):
                     dim=out_dim,
                     dropout=getattr(config, "fusion_dropout", 0.0),
                 )
+            elif fusion_mode == "decoupled_evidence_prompt":
+                self.decoupled_mask_prompt = DecoupledMaskPrompt(
+                    dim=out_dim,
+                    hidden_dim=getattr(config, "faithful_fusion_hidden_dim", out_dim),
+                    max_delta_ratio=getattr(config, "faithful_max_delta_ratio", 0.15),
+                )
             elif fusion_mode == "faithful_evidence_fusion":
                 self.faithful_evidence_fusion = FaithfulEvidenceFusion(
                     dim=out_dim,
@@ -413,6 +420,8 @@ class LisatMetaModel(nn.Module):
                 modules.append(self.evidence_fusion)
             elif fusion_mode == "evidence_feedback":
                 modules.append(self.evidence_fusion)
+            elif fusion_mode == "decoupled_evidence_prompt":
+                modules.append(self.decoupled_mask_prompt)
             elif fusion_mode == "faithful_evidence_fusion":
                 modules.append(self.faithful_evidence_fusion)
             elif fusion_mode == "sparse_dense":
@@ -484,6 +493,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         if self.dia_fusion_mode not in {
             "legacy",
             "faithful_evidence_fusion",
+            "decoupled_evidence_prompt",
             "sparse_dense",
             "bounded_sparse_dense",
             "latent_sparse_dense_dia",
@@ -494,6 +504,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             "sparse_dense",
             "bounded_sparse_dense",
             "faithful_evidence_fusion",
+            "decoupled_evidence_prompt",
             "evidence_feedback",
         }:
             if not self.use_dia:
@@ -869,6 +880,8 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 modules.append(self.model.evidence_fusion)
             elif self.dia_fusion_mode == "evidence_feedback":
                 modules.append(self.model.evidence_fusion)
+            elif self.dia_fusion_mode == "decoupled_evidence_prompt":
+                modules.append(self.model.decoupled_mask_prompt)
             elif self.dia_fusion_mode == "faithful_evidence_fusion":
                 modules.append(self.model.faithful_evidence_fusion)
             elif self.dia_fusion_mode == "sparse_dense":
@@ -1164,10 +1177,12 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                             f"image={i}, con={con_i.shape[0]}, seg={seg_i.shape[0]}."
                         )
                     num_prompts = seg_i.shape[0]
-                elif self.dia_fusion_mode == "faithful_evidence_fusion":
+                elif self.dia_fusion_mode in {
+                    "faithful_evidence_fusion", "decoupled_evidence_prompt"
+                }:
                     if con_i.shape[0] != seg_i.shape[0]:
                         raise RuntimeError(
-                            "faithful_evidence_fusion requires one CON per SEG: "
+                            f"{self.dia_fusion_mode} requires one CON per SEG: "
                             f"image={i}, con={con_i.shape[0]}, seg={seg_i.shape[0]}."
                         )
                     num_prompts = seg_i.shape[0]
@@ -1273,6 +1288,17 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                         debug_stats["fusion_strengths"].append(
                             fusion_strength.float().mean()
                         )
+                elif self.dia_fusion_mode == "decoupled_evidence_prompt":
+                    prompt_tokens = self.model.decoupled_mask_prompt(
+                        evidence_tokens=evidence_tokens,
+                        num_prompts=num_prompts,
+                    )
+                    ratio = self.model.decoupled_mask_prompt.last_delta_ratio
+                    if ratio is not None:
+                        debug_stats["evidence_delta_ratios"].append(
+                            ratio.float().mean()
+                        )
+                    gate_mean = None
                 elif self.dia_fusion_mode == "faithful_evidence_fusion":
                     prompt_tokens = self.model.faithful_evidence_fusion(
                         seg_embeddings=seg_i,
@@ -1757,6 +1783,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 self.use_dia
                 and self.dia_fusion_mode in {
                     "faithful_evidence_fusion",
+                    "decoupled_evidence_prompt",
                     "latent_sparse_dense_dia",
                     "evidence_feedback",
                 }
@@ -2302,6 +2329,7 @@ def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **
             "sparse_dense",
             "bounded_sparse_dense",
             "faithful_evidence_fusion",
+            "decoupled_evidence_prompt",
             "evidence_feedback",
         }
         and not explicit_con_in_conversation
@@ -2544,6 +2572,12 @@ def _validate_dia_structure(model):
 
     if fusion_mode == "legacy":
         assert base_model.evidence_fusion.res_scale.detach().item() == 0.0
+    elif fusion_mode == "decoupled_evidence_prompt":
+        fusion = base_model.decoupled_mask_prompt
+        assert fusion.evidence_norm.elementwise_affine is False
+        assert fusion.evidence_in.bias is None
+        assert fusion.evidence_out.bias is None
+        assert torch.count_nonzero(fusion.evidence_out.weight.detach()).item() == 0
     elif fusion_mode == "faithful_evidence_fusion":
         fusion = base_model.faithful_evidence_fusion
         expected_hidden_dim = getattr(
@@ -3186,6 +3220,8 @@ def init_LISAT_model(args, model_args):
                 trainable_parts.append("evidence_fusion")
             elif fusion_mode == "evidence_feedback":
                 trainable_parts.append("evidence_fusion")
+            elif fusion_mode == "decoupled_evidence_prompt":
+                trainable_parts.append("decoupled_mask_prompt")
             elif fusion_mode == "faithful_evidence_fusion":
                 trainable_parts.append("faithful_evidence_fusion")
             elif fusion_mode == "sparse_dense":
