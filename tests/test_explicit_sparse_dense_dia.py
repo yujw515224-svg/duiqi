@@ -62,7 +62,7 @@ def test_sparse_dense_validation_accepts_low_precision_gate_bias():
 
     class FakeBase:
         config = FakeConfig()
-        evidence_adapter = FakeAdapter()
+        context_adapter = FakeAdapter()
         explicit_token_bridge = ExplicitTokenBridge(dim=8, init_gate=0.02).to(
             torch.bfloat16
         )

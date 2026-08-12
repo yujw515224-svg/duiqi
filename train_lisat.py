@@ -577,6 +577,34 @@ def parse_args(args):
     parser.add_argument("--vqa_data", default="llava_instruct_150k")
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train")
     parser.add_argument("--geo_reason_seg_data", default="GeoReasonSeg|train")
+    parser.add_argument(
+        "--dia_align_aug_source_dataset",
+        default="sem_seg||refer_seg||reason_seg||geo_reason_seg",
+        help="Source segmentation datasets wrapped by dia_align_aug.",
+    )
+    parser.add_argument(
+        "--dia_align_aug_source_rates",
+        default="15,15,1,36",
+        help="Sampling rates for --dia_align_aug_source_dataset.",
+    )
+    parser.add_argument(
+        "--dia_align_aug_positive_prob",
+        type=float,
+        default=0.5,
+        help="Probability of target-preserved density-reduced DIA alignment samples.",
+    )
+    parser.add_argument(
+        "--dia_align_aug_background_scale",
+        type=float,
+        default=0.2,
+        help="Scale applied to non-target pixels in positive density-reduced samples.",
+    )
+    parser.add_argument(
+        "--dia_align_aug_mask_dilation",
+        type=int,
+        default=2,
+        help="Mask dilation in preprocessed image space for DIA edited views.",
+    )
     parser.add_argument("--eval_dataset", choices=["auto", "refsegrs", "geo_reason_seg"], default="geo_reason_seg")
     parser.add_argument("--eval_split", choices=["val", "test"], default="val")
     parser.add_argument("--eval_samples", type=int, default=0, help="0 means evaluate the full split")
@@ -1114,9 +1142,15 @@ def main(args):
         sem_seg_data=args.sem_seg_data,
         refer_seg_data=args.refer_seg_data,
         neg_refer_seg_data=args.neg_refer_seg_data,
+        correct_refer_seg_data=args.correct_refer_seg_data,
         vqa_data=args.vqa_data,
         reason_seg_data=args.reason_seg_data,
         geo_reason_seg_data=args.geo_reason_seg_data,
+        dia_align_aug_source_dataset=args.dia_align_aug_source_dataset,
+        dia_align_aug_source_rates=args.dia_align_aug_source_rates,
+        dia_align_aug_positive_prob=args.dia_align_aug_positive_prob,
+        dia_align_aug_background_scale=args.dia_align_aug_background_scale,
+        dia_align_aug_mask_dilation=args.dia_align_aug_mask_dilation,
     )
 
     # ---- Build validation set ----

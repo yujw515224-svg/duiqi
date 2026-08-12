@@ -165,6 +165,11 @@ class HybridDataset(torch.utils.data.Dataset):
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         geo_reason_seg_data="geo_reason_seg|train",
+        dia_align_aug_source_dataset="sem_seg||refer_seg||reason_seg||geo_reason_seg",
+        dia_align_aug_source_rates="15,15,1,36",
+        dia_align_aug_positive_prob=0.5,
+        dia_align_aug_background_scale=0.2,
+        dia_align_aug_mask_dilation=2,
     ):
         self.samples_per_epoch = samples_per_epoch
         sample_rate = np.array(sample_rate)
@@ -293,6 +298,29 @@ class HybridDataset(torch.utils.data.Dataset):
                         split="train",
                         is_train=True,
                         align_root_name="RefSegRS_DIAAlign_4",
+                    )
+                )
+            elif dataset == "dia_align_aug":
+                from .dia_align_aug_dataset import DIAAlignAugDataset
+
+                self.all_datasets.append(
+                    DIAAlignAugDataset(
+                        base_image_dir,
+                        vision_tower,
+                        samples_per_epoch,
+                        image_size,
+                        num_classes_per_sample,
+                        source_dataset=dia_align_aug_source_dataset,
+                        source_sample_rate=dia_align_aug_source_rates,
+                        sem_seg_data=sem_seg_data,
+                        refer_seg_data=refer_seg_data,
+                        neg_refer_seg_data=neg_refer_seg_data,
+                        correct_refer_seg_data=correct_refer_seg_data,
+                        reason_seg_data=reason_seg_data,
+                        geo_reason_seg_data=geo_reason_seg_data,
+                        positive_prob=dia_align_aug_positive_prob,
+                        background_scale=dia_align_aug_background_scale,
+                        mask_dilation=dia_align_aug_mask_dilation,
                     )
                 )
             else:
