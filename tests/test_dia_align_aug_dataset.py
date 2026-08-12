@@ -101,4 +101,7 @@ def test_aug_dataset_positive_and_negative_protocols():
     assert neg[4].shape == (0, 8, 8)
     assert neg[6] == [False]
     assert "[SEG]" not in neg[3][0]
+    assert "[CON]" in neg[3][0]
     assert "Remote-sensing evidence" in neg[3][0]
+    assert "upper-left" not in neg[3][0]
+    assert "%" not in neg[3][0]

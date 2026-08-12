@@ -32,6 +32,7 @@ from .DIA_LISAt import (
     ContextEvidenceAdapter,
     DenseEvidencePrompt,
     DecoupledMaskPrompt,
+    EvidencePresenceHead,
     EvidenceGuideFusion,
     EvidenceGuideFusionV2,
     EvidenceVisualBottleneck,
@@ -280,6 +281,10 @@ class LisatMetaModel(nn.Module):
                     hidden_dim=getattr(config, "faithful_fusion_hidden_dim", out_dim),
                     max_delta_ratio=getattr(config, "faithful_max_delta_ratio", 0.15),
                 )
+                self.evidence_presence_head = EvidencePresenceHead(
+                    dim=out_dim,
+                    hidden_dim=getattr(config, "presence_hidden_dim", out_dim),
+                )
             elif fusion_mode == "faithful_evidence_fusion":
                 self.faithful_evidence_fusion = FaithfulEvidenceFusion(
                     dim=out_dim,
@@ -421,7 +426,9 @@ class LisatMetaModel(nn.Module):
             elif fusion_mode == "evidence_feedback":
                 modules.append(self.evidence_fusion)
             elif fusion_mode == "decoupled_evidence_prompt":
-                modules.append(self.decoupled_mask_prompt)
+                modules.extend(
+                    [self.decoupled_mask_prompt, self.evidence_presence_head]
+                )
             elif fusion_mode == "faithful_evidence_fusion":
                 modules.append(self.faithful_evidence_fusion)
             elif fusion_mode == "sparse_dense":
@@ -668,6 +675,18 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             "attn_loss_weight",
             getattr(config, "attn_loss_weight", 0.02),
         )
+        self.presence_loss_weight = kwargs.pop(
+            "presence_loss_weight",
+            getattr(config, "presence_loss_weight", 0.20),
+        )
+        self.prompt_distill_loss_weight = kwargs.pop(
+            "prompt_distill_loss_weight",
+            getattr(config, "prompt_distill_loss_weight", 0.10),
+        )
+        self.prompt_distill_decay_steps = kwargs.pop(
+            "prompt_distill_decay_steps",
+            getattr(config, "prompt_distill_decay_steps", 4000),
+        )
         if not self.use_dia:
             self.attn_loss_weight = 0.0
             self.evidence_usage_loss_weight = 0.0
@@ -698,6 +717,9 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             getattr(config, "fusion_dropout", 0.0),
         )
         config.attn_loss_weight = self.attn_loss_weight
+        config.presence_loss_weight = self.presence_loss_weight
+        config.prompt_distill_loss_weight = self.prompt_distill_loss_weight
+        config.prompt_distill_decay_steps = self.prompt_distill_decay_steps
         self.map_loss_weight = kwargs.pop(
             "map_loss_weight",
             getattr(config, "map_loss_weight", 0.10),
@@ -881,7 +903,12 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             elif self.dia_fusion_mode == "evidence_feedback":
                 modules.append(self.model.evidence_fusion)
             elif self.dia_fusion_mode == "decoupled_evidence_prompt":
-                modules.append(self.model.decoupled_mask_prompt)
+                modules.extend(
+                    [
+                        self.model.decoupled_mask_prompt,
+                        self.model.evidence_presence_head,
+                    ]
+                )
             elif self.dia_fusion_mode == "faithful_evidence_fusion":
                 modules.append(self.model.faithful_evidence_fusion)
             elif self.dia_fusion_mode == "sparse_dense":
@@ -1005,7 +1032,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         return token_mask[:, :hidden_len]
 
     def validate_explicit_con_seg_pairs(self, input_ids):
-        """Check raw token IDs before hidden-state shifting."""
+        """Validate positive pairs while permitting concept-only negatives."""
         if self.con_token_idx is None:
             raise RuntimeError("Explicit DIA requires a valid [CON] token id.")
 
@@ -1013,28 +1040,29 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             con_pos = (row == self.con_token_idx).nonzero(as_tuple=False).flatten()
             seg_pos = (row == self.seg_token_idx).nonzero(as_tuple=False).flatten()
 
-            if con_pos.numel() != seg_pos.numel():
+            if con_pos.numel() < seg_pos.numel():
                 raise RuntimeError(
-                    "Explicit DIA requires equal [CON]/[SEG] counts, "
+                    "Explicit DIA cannot contain more [SEG] than [CON] tokens, "
                     f"row={row_idx}, con={con_pos.numel()}, seg={seg_pos.numel()}."
                 )
             if con_pos.numel() == 0:
                 continue
-            if not torch.equal(seg_pos, con_pos + 1):
+            con_set = set(con_pos.tolist())
+            if any(int(pos) - 1 not in con_set for pos in seg_pos.tolist()):
                 raise RuntimeError(
                     "Explicit DIA requires every [SEG] to immediately follow [CON], "
                     f"row={row_idx}, con_pos={con_pos.tolist()}, seg_pos={seg_pos.tolist()}."
                 )
 
     def build_dia_token_masks(self, input_ids, hidden_len):
-        """Return separate hidden-state masks for explicit [SEG] and [CON] tokens."""
+        """Return SEG, paired-CON, and all-CON hidden-state masks."""
         seg_token_mask = self.build_shifted_token_mask(
             input_ids=input_ids,
             token_idx=self.seg_token_idx,
             hidden_len=hidden_len,
         )
         if not self.use_dia or not self.explicit_con_in_conversation:
-            return seg_token_mask, seg_token_mask
+            return seg_token_mask, seg_token_mask, seg_token_mask
 
         self.validate_explicit_con_seg_pairs(input_ids)
         con_token_mask = self.build_shifted_token_mask(
@@ -1043,18 +1071,18 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             hidden_len=hidden_len,
         )
 
+        paired_con_token_mask = torch.zeros_like(con_token_mask)
+        paired_con_token_mask[:, :-1] = seg_token_mask[:, 1:]
+        paired_con_token_mask &= con_token_mask
         seg_counts = seg_token_mask.int().sum(-1)
-        con_counts = con_token_mask.int().sum(-1)
-        if not torch.equal(seg_counts, con_counts):
-            raise RuntimeError(
-                "Explicit DIA shifted mask counts differ: "
-                f"con={con_counts.tolist()}, seg={seg_counts.tolist()}."
-            )
+        paired_counts = paired_con_token_mask.int().sum(-1)
+        if not torch.equal(seg_counts, paired_counts):
+            raise RuntimeError("Every [SEG] must have one adjacent paired [CON].")
         if int(seg_token_mask.sum().item()) > 0 and torch.equal(seg_token_mask, con_token_mask):
             raise RuntimeError(
                 "Explicit DIA [CON] and [SEG] masks are identical; expected adjacent hidden states."
             )
-        return seg_token_mask, con_token_mask
+        return seg_token_mask, paired_con_token_mask, con_token_mask
 
     
     def split_embeddings_by_offset(self, flat_embeddings, token_mask, offset):
@@ -1089,6 +1117,8 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         sam_mask_shape_list,
         anchor_embeddings=None,
         dia_global_step=None,
+        all_con_embeddings=None,
+        presence_targets=None,
     ):
         """Generate predicted masks from SAM prompt embeddings.
 
@@ -1142,6 +1172,9 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             "attention_normalized_entropies": [],
             "sam_prompt_encoder_calls": [],
             "sam_mask_decoder_calls": [],
+            "presence_logits": [],
+            "presence_targets": [],
+            "prompt_distill_losses": [],
         }
         for i in range(len(seg_embeddings)):
             seg_i = seg_embeddings[i]
@@ -1151,6 +1184,44 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 if anchor_embeddings is not None
                 else None
             )
+
+            # Presence is evaluated for every concept, including standalone
+            # negative [CON] tokens which intentionally have no [SEG].
+            if (
+                self.use_dia
+                and self.dia_fusion_mode == "decoupled_evidence_prompt"
+                and all_con_embeddings is not None
+            ):
+                all_con_i = all_con_embeddings[i]
+                if all_con_i.shape[0] > 0:
+                    presence_dtype = next(
+                        self.model.visual_model.mask_decoder.parameters()
+                    ).dtype
+                    presence_image = image_embeddings[i].unsqueeze(0).to(
+                        dtype=presence_dtype
+                    )
+                    presence_pe = self.model.visual_model.prompt_encoder.get_dense_pe().to(
+                        device=presence_image.device, dtype=presence_dtype
+                    )
+                    all_con_i = all_con_i.to(
+                        device=presence_image.device, dtype=presence_dtype
+                    )
+                    presence_evidence, _ = self.model.context_adapter(
+                        con_embeddings=all_con_i,
+                        image_embeddings=presence_image,
+                        image_pe=presence_pe,
+                    )
+                    presence_logits = self.model.evidence_presence_head(
+                        all_con_i, presence_evidence
+                    )
+                    debug_stats["presence_logits"].append(presence_logits)
+                    if presence_targets is not None:
+                        debug_stats["presence_targets"].append(
+                            presence_targets[i].to(
+                                device=presence_logits.device,
+                                dtype=presence_logits.dtype,
+                            )
+                        )
 
             input_size, original_size = sam_mask_shape_list[i]
             input_size = (int(input_size[0]), int(input_size[1]))
@@ -1298,6 +1369,12 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                         debug_stats["evidence_delta_ratios"].append(
                             ratio.float().mean()
                         )
+                    # The original projected [SEG] is a detached teacher target
+                    # only; it is never an input to the student/SAM forward path.
+                    student_summary = prompt_tokens.mean(dim=1)
+                    debug_stats["prompt_distill_losses"].append(
+                        F.smooth_l1_loss(student_summary.float(), seg_i.detach().float())
+                    )
                     gate_mean = None
                 elif self.dia_fusion_mode == "faithful_evidence_fusion":
                     prompt_tokens = self.model.faithful_evidence_fusion(
@@ -1684,10 +1761,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
         hidden_len = last_hidden_state.shape[1]
 
         if self.use_dia:
-            seg_token_mask, con_token_mask = self.build_dia_token_masks(
+            seg_token_mask, paired_con_token_mask, all_con_token_mask = self.build_dia_token_masks(
                 input_ids=input_ids,
                 hidden_len=hidden_len,
             )
+            con_token_mask = all_con_token_mask
         else:
             seg_token_mask = self.build_shifted_token_mask(
                 input_ids=input_ids,
@@ -1695,13 +1773,32 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 hidden_len=hidden_len,
             )
             con_token_mask = None
+            paired_con_token_mask = None
+            all_con_token_mask = None
 
         seg_hidden = last_hidden_state[seg_token_mask]
         seg_flat = self.model.text_hidden_fcs[0](seg_hidden)
         seg_embeddings = self.split_embeddings_by_offset(seg_flat, seg_token_mask, offset)
+        if (
+            self.training
+            and self.use_dia
+            and self.dia_fusion_mode == "decoupled_evidence_prompt"
+            and not bool(self.model.decoupled_mask_prompt.anchor_initialized.item())
+        ):
+            teacher_sum = seg_flat.detach().float().sum(dim=0)
+            teacher_count = teacher_sum.new_tensor(float(seg_flat.shape[0]))
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(teacher_sum)
+                torch.distributed.all_reduce(teacher_count)
+            self.model.decoupled_mask_prompt.initialize_anchor_from_teacher(
+                teacher_sum.to(self.model.decoupled_mask_prompt.decoder_anchor),
+                teacher_count.to(self.model.decoupled_mask_prompt.decoder_anchor),
+            )
         anchor_embeddings = None
+        all_con_embeddings = None
+        presence_targets = None
         if self.use_dia:
-            con_hidden = last_hidden_state[con_token_mask]
+            con_hidden = last_hidden_state[paired_con_token_mask]
             if con_hidden.shape[0] != seg_hidden.shape[0]:
                 raise RuntimeError(
                     "DIA prompt/concept hidden counts differ before projection: "
@@ -1710,8 +1807,19 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             con_flat = self.model.con_hidden_fcs[0](con_hidden)
             con_embeddings = self.split_embeddings_by_offset(
                 con_flat,
-                con_token_mask,
+                paired_con_token_mask,
                 offset,
+            )
+            all_con_hidden = last_hidden_state[all_con_token_mask]
+            all_con_flat = self.model.con_hidden_fcs[0](all_con_hidden)
+            all_con_embeddings = self.split_embeddings_by_offset(
+                all_con_flat, all_con_token_mask, offset
+            )
+            presence_target_flat = paired_con_token_mask[all_con_token_mask].to(
+                dtype=all_con_flat.dtype
+            )
+            presence_targets = self.split_embeddings_by_offset(
+                presence_target_flat, all_con_token_mask, offset
             )
             if self.dia_fusion_mode in {
                 "sparse_dense",
@@ -1721,7 +1829,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                 anchor_flat = self.model.text_hidden_fcs[0](con_hidden)
                 anchor_embeddings = self.split_embeddings_by_offset(
                     anchor_flat,
-                    con_token_mask,
+                    paired_con_token_mask,
                     offset,
                 )
         else:
@@ -1745,6 +1853,8 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             sam_mask_shape_list=sam_mask_shape_list,
             anchor_embeddings=anchor_embeddings,
             dia_global_step=dia_global_step,
+            all_con_embeddings=all_con_embeddings,
+            presence_targets=presence_targets,
         )
 
         # If inference => return masks
@@ -1790,6 +1900,49 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             ),
             dia_fusion_mode=self.dia_fusion_mode if self.use_dia else "legacy",
             map_loss_weight=self.map_loss_weight if self.use_dia else 0.0,
+        )
+
+        presence_loss = ce_loss.new_zeros(())
+        num_presence_positive = ce_loss.new_zeros(())
+        num_presence_negative = ce_loss.new_zeros(())
+        prompt_distill_loss = ce_loss.new_zeros(())
+        prompt_distill_weight = ce_loss.new_zeros(())
+        if self.use_dia and self.dia_fusion_mode == "decoupled_evidence_prompt":
+            logits_parts = dia_debug_stats["presence_logits"]
+            target_parts = dia_debug_stats["presence_targets"]
+            if logits_parts:
+                presence_logits = torch.cat(logits_parts)
+                presence_target = torch.cat(target_parts).to(presence_logits.device)
+                presence_loss = F.binary_cross_entropy_with_logits(
+                    presence_logits.float(), presence_target.float()
+                )
+                num_presence_positive = (presence_target > 0.5).sum().to(ce_loss)
+                num_presence_negative = (presence_target <= 0.5).sum().to(ce_loss)
+                loss_dict["loss"] = (
+                    loss_dict["loss"]
+                    + self.presence_loss_weight * presence_loss
+                )
+            if dia_debug_stats["prompt_distill_losses"]:
+                prompt_distill_loss = torch.stack(
+                    dia_debug_stats["prompt_distill_losses"]
+                ).mean()
+                base_weight = float(self.prompt_distill_loss_weight)
+                decay_steps = max(1, int(self.prompt_distill_decay_steps))
+                step = 0 if dia_global_step is None else int(dia_global_step)
+                decay = max(0.0, 1.0 - step / decay_steps)
+                prompt_distill_weight = ce_loss.new_tensor(base_weight * decay)
+                loss_dict["loss"] = (
+                    loss_dict["loss"]
+                    + prompt_distill_weight * prompt_distill_loss
+                )
+        loss_dict.update(
+            {
+                "presence_loss": presence_loss,
+                "num_presence_positive": num_presence_positive,
+                "num_presence_negative": num_presence_negative,
+                "prompt_distill_loss": prompt_distill_loss,
+                "prompt_distill_weight": prompt_distill_weight,
+            }
         )
 
         graph_anchor = ce_loss.new_zeros(())
@@ -2191,10 +2344,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
             try:
                 if self.use_dia:
-                    seg_token_mask, con_token_mask = self.build_dia_token_masks(
+                    seg_token_mask, paired_con_token_mask, all_con_token_mask = self.build_dia_token_masks(
                         input_ids=output_ids,
                         hidden_len=hidden_len,
                     )
+                    con_token_mask = paired_con_token_mask
                 else:
                     seg_token_mask = self.build_shifted_token_mask(
                         input_ids=output_ids,
@@ -2233,6 +2387,7 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
             seg_flat = self.model.text_hidden_fcs[0](seg_hidden)
             seg_embeddings = self.split_embeddings_by_offset(seg_flat, seg_token_mask, offset)
             anchor_embeddings = None
+            all_con_embeddings = None
             if self.use_dia:
                 con_hidden = last_hidden_state[con_token_mask]
                 if con_hidden.shape[0] != seg_hidden.shape[0]:
@@ -2259,6 +2414,11 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
                     con_token_mask,
                     offset,
                 )
+                all_con_hidden = last_hidden_state[all_con_token_mask]
+                all_con_flat = self.model.con_hidden_fcs[0](all_con_hidden)
+                all_con_embeddings = self.split_embeddings_by_offset(
+                    all_con_flat, all_con_token_mask, offset
+                )
                 if self.dia_fusion_mode in {
                     "sparse_dense",
                     "bounded_sparse_dense",
@@ -2276,13 +2436,22 @@ class LISATForCausalLM(LlavaLlamaForCausalLM):
 
             image_embeddings = self.get_visual_embs(images)
 
-            pred_masks, _, _ = self.generate_pred_masks(
+            pred_masks, _, eval_debug_stats = self.generate_pred_masks(
                 seg_embeddings=seg_embeddings,
                 con_embeddings=con_embeddings,
                 image_embeddings=image_embeddings,
                 sam_mask_shape_list=sam_mask_shape_list,
                 anchor_embeddings=anchor_embeddings,
+                all_con_embeddings=all_con_embeddings,
             )
+
+            if self.dia_fusion_mode == "decoupled_evidence_prompt":
+                presence_logits = eval_debug_stats["presence_logits"]
+                if len(presence_logits) == len(object_presence):
+                    object_presence = [
+                        bool(p.sigmoid().amax().item() >= 0.5)
+                        for p in presence_logits
+                    ]
 
             output_pred_masks = []
             for i, pred_mask in enumerate(pred_masks):
@@ -2340,6 +2509,14 @@ def load_pretrained_model_LISAT(model_path, device_map="auto", device="cuda", **
     config.use_dia = use_dia
     config.explicit_con_in_conversation = explicit_con_in_conversation
     config.dia_fusion_mode = dia_fusion_mode
+    config.presence_hidden_dim = kwargs.get("presence_hidden_dim", 256)
+    config.presence_loss_weight = kwargs.get("presence_loss_weight", 0.20)
+    config.prompt_distill_loss_weight = kwargs.get(
+        "prompt_distill_loss_weight", 0.10
+    )
+    config.prompt_distill_decay_steps = kwargs.get(
+        "prompt_distill_decay_steps", 4000
+    )
     config.faithful_fusion_hidden_dim = kwargs.get(
         "faithful_fusion_hidden_dim",
         getattr(config, "faithful_fusion_hidden_dim", 256),
@@ -2577,7 +2754,7 @@ def _validate_dia_structure(model):
         assert fusion.evidence_norm.elementwise_affine is False
         assert fusion.evidence_in.bias is None
         assert fusion.evidence_out.bias is None
-        assert torch.count_nonzero(fusion.evidence_out.weight.detach()).item() == 0
+        assert hasattr(base_model, "evidence_presence_head")
     elif fusion_mode == "faithful_evidence_fusion":
         fusion = base_model.faithful_evidence_fusion
         expected_hidden_dim = getattr(
@@ -3178,6 +3355,8 @@ def init_LISAT_model(args, model_args):
         "explicit_role_adapter",
         "bounded_dense_evidence_prompt",
         "faithful_evidence_fusion",
+        "decoupled_mask_prompt",
+        "evidence_presence_head",
         "latent_sparse_fusion",
         "latent_dense_evidence_prompt",
         "evidence_visual_bottleneck",
@@ -3210,6 +3389,11 @@ def init_LISAT_model(args, model_args):
     else:
         trainable_parts = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
 
+    if args.use_dia and fusion_mode == "decoupled_evidence_prompt":
+        # The frozen projector supplies detached teacher targets only. Keeping it
+        # trainable would produce rank-dependent unused parameters under ZeRO.
+        trainable_parts = [p for p in trainable_parts if p != "text_hidden_fcs"]
+
     if args.use_dia:
         trainable_parts.extend(["con_hidden_fcs", "context_adapter"])
         if not (
@@ -3221,7 +3405,9 @@ def init_LISAT_model(args, model_args):
             elif fusion_mode == "evidence_feedback":
                 trainable_parts.append("evidence_fusion")
             elif fusion_mode == "decoupled_evidence_prompt":
-                trainable_parts.append("decoupled_mask_prompt")
+                trainable_parts.extend(
+                    ["decoupled_mask_prompt", "evidence_presence_head"]
+                )
             elif fusion_mode == "faithful_evidence_fusion":
                 trainable_parts.append("faithful_evidence_fusion")
             elif fusion_mode == "sparse_dense":

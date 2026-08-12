@@ -1082,11 +1082,20 @@ class DecoupledMaskPrompt(nn.Module):
         self.max_delta_ratio = float(max_delta_ratio)
         self.decoder_anchor = nn.Parameter(torch.empty(1, dim))
         nn.init.normal_(self.decoder_anchor, std=0.02)
+        self.register_buffer("anchor_initialized", torch.tensor(False), persistent=True)
         self.evidence_norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.evidence_in = nn.Linear(dim, hidden_dim, bias=False)
         self.evidence_out = nn.Linear(hidden_dim, dim, bias=False)
         nn.init.zeros_(self.evidence_out.weight)
         self.last_delta_ratio = None
+
+    @torch.no_grad()
+    def initialize_anchor_from_teacher(self, teacher_sum, teacher_count):
+        """Seed the shared anchor once from a distributed teacher-prompt mean."""
+        if bool(self.anchor_initialized.item()) or float(teacher_count.item()) <= 0:
+            return
+        self.decoder_anchor.copy_((teacher_sum / teacher_count).view(1, self.dim))
+        self.anchor_initialized.fill_(True)
 
     def forward(self, evidence_tokens, num_prompts):
         if evidence_tokens.ndim != 3 or evidence_tokens.shape[-1] != self.dim:
@@ -1099,18 +1108,42 @@ class DecoupledMaskPrompt(nn.Module):
                 f"prompt/evidence mismatch: {num_prompts} vs "
                 f"{evidence_tokens.shape[0]}"
             )
-        evidence = evidence_tokens.mean(dim=1)
+        # Preserve K independently retrieved local evidence tokens.  Collapsing
+        # them with a mean would recreate the single-token information bottleneck.
         raw_delta = self.evidence_out(
-            F.gelu(self.evidence_in(self.evidence_norm(evidence)))
+            F.gelu(self.evidence_in(self.evidence_norm(evidence_tokens)))
         )
         anchor = self.decoder_anchor.to(
             device=raw_delta.device, dtype=raw_delta.dtype
-        ).expand(int(num_prompts), -1)
+        ).view(1, 1, self.dim).expand_as(raw_delta)
         delta, _, ratio, _ = _bounded_residual(
             raw_delta, anchor, self.max_delta_ratio
         )
         self.last_delta_ratio = ratio.detach()
-        return (anchor + delta).unsqueeze(1)
+        return anchor + delta
+
+
+class EvidencePresenceHead(nn.Module):
+    """Predict whether a concept has supporting visual evidence.
+
+    The head consumes only the explicit concept representation and retrieved
+    visual evidence; it never reads the instance-specific [SEG] hidden state.
+    """
+
+    def __init__(self, dim=256, hidden_dim=256):
+        super().__init__()
+        self.con_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.evidence_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.input = nn.Linear(dim * 3, hidden_dim, bias=False)
+        self.output = nn.Linear(hidden_dim, 1)
+
+    def forward(self, con_embeddings, evidence_tokens):
+        if con_embeddings.ndim != 2 or evidence_tokens.ndim != 3:
+            raise RuntimeError("presence inputs must be [N,D] and [N,K,D]")
+        evidence = self.evidence_norm(evidence_tokens.mean(dim=1))
+        concept = self.con_norm(con_embeddings)
+        joint = torch.cat([concept, evidence, concept * evidence], dim=-1)
+        return self.output(F.gelu(self.input(joint))).squeeze(-1)
 
 
 class LatentSparseEvidenceFusion(nn.Module):

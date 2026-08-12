@@ -15,7 +15,8 @@ def insert_explicit_con(conversation):
     """Convert an original LISAt [SEG] answer into the explicit DIA token pair."""
     if "[CON]" in conversation:
         remainder = conversation.replace(EXPLICIT_PAIR, "")
-        if "[CON]" in remainder or "[SEG]" in remainder:
+        remainder = remainder.replace("[CON]", "")
+        if "[SEG]" in remainder:
             raise RuntimeError(
                 "Conversation contains an invalid [CON]/[SEG] sequence."
             )
@@ -31,7 +32,12 @@ def _single_token_id(tokenizer, token):
 
 
 def validate_explicit_pairs(input_ids, attention_masks, tokenizer):
-    """Validate that explicit DIA conversations contain adjacent [CON][SEG] pairs."""
+    """Validate explicit DIA routing, including concept-only negatives.
+
+    Every ``[SEG]`` must be immediately preceded by ``[CON]``.  A standalone
+    ``[CON]`` is intentionally valid: it asks the evidence branch to verify a
+    concept without requesting mask decoding.
+    """
     con_id = _single_token_id(tokenizer, "[CON]")
     seg_id = _single_token_id(tokenizer, "[SEG]")
     pair_ids = tokenizer(EXPLICIT_PAIR, add_special_tokens=False).input_ids
@@ -46,16 +52,17 @@ def validate_explicit_pairs(input_ids, attention_masks, tokenizer):
         con_pos = [idx for idx, token_id in enumerate(valid_ids) if token_id == con_id]
         seg_pos = [idx for idx, token_id in enumerate(valid_ids) if token_id == seg_id]
 
-        if len(con_pos) != len(seg_pos):
+        if len(con_pos) < len(seg_pos):
             raise RuntimeError(
-                "Explicit DIA requires equal [CON]/[SEG] counts after tokenization "
+                "Explicit DIA cannot contain more [SEG] than [CON] tokens "
                 f"and truncation, row={row_idx}, con={len(con_pos)}, seg={len(seg_pos)}."
             )
-        for pair_idx, (con_i, seg_i) in enumerate(zip(con_pos, seg_pos)):
-            if seg_i != con_i + 1:
+        con_pos_set = set(con_pos)
+        for pair_idx, seg_i in enumerate(seg_pos):
+            if seg_i - 1 not in con_pos_set:
                 raise RuntimeError(
                     "Explicit DIA requires every [SEG] to immediately follow [CON], "
-                    f"row={row_idx}, pair={pair_idx}, con_pos={con_i}, seg_pos={seg_i}."
+                    f"row={row_idx}, pair={pair_idx}, seg_pos={seg_i}."
                 )
 
 
