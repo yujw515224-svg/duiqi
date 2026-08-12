@@ -1063,6 +1063,56 @@ class FaithfulEvidenceFusion(nn.Module):
         return (seg_embeddings + evidence_delta).unsqueeze(1)
 
 
+class DecoupledMaskPrompt(nn.Module):
+    """Build a SAM prompt from visual evidence without reading ``[SEG]``.
+
+    ``[SEG]`` is deliberately reduced to a routing/count signal.  Target
+    semantics can therefore reach SAM only through the ``[CON]`` query and its
+    retrieved visual evidence.  Keeping ``seg_embeddings`` out of this API is
+    an architectural guard against restoring the original semantic shortcut.
+    """
+
+    def __init__(self, dim=256, hidden_dim=256, max_delta_ratio=0.15):
+        super().__init__()
+        if dim <= 0 or hidden_dim <= 0:
+            raise ValueError("dim and hidden_dim must be positive")
+        if max_delta_ratio <= 0:
+            raise ValueError("max_delta_ratio must be positive")
+        self.dim = int(dim)
+        self.max_delta_ratio = float(max_delta_ratio)
+        self.decoder_anchor = nn.Parameter(torch.empty(1, dim))
+        nn.init.normal_(self.decoder_anchor, std=0.02)
+        self.evidence_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.evidence_in = nn.Linear(dim, hidden_dim, bias=False)
+        self.evidence_out = nn.Linear(hidden_dim, dim, bias=False)
+        nn.init.zeros_(self.evidence_out.weight)
+        self.last_delta_ratio = None
+
+    def forward(self, evidence_tokens, num_prompts):
+        if evidence_tokens.ndim != 3 or evidence_tokens.shape[-1] != self.dim:
+            raise RuntimeError(
+                "evidence_tokens must be [P,K,dim], got "
+                f"{tuple(evidence_tokens.shape)}"
+            )
+        if int(num_prompts) != evidence_tokens.shape[0]:
+            raise RuntimeError(
+                f"prompt/evidence mismatch: {num_prompts} vs "
+                f"{evidence_tokens.shape[0]}"
+            )
+        evidence = evidence_tokens.mean(dim=1)
+        raw_delta = self.evidence_out(
+            F.gelu(self.evidence_in(self.evidence_norm(evidence)))
+        )
+        anchor = self.decoder_anchor.to(
+            device=raw_delta.device, dtype=raw_delta.dtype
+        ).expand(int(num_prompts), -1)
+        delta, _, ratio, _ = _bounded_residual(
+            raw_delta, anchor, self.max_delta_ratio
+        )
+        self.last_delta_ratio = ratio.detach()
+        return (anchor + delta).unsqueeze(1)
+
+
 class LatentSparseEvidenceFusion(nn.Module):
     """Aggressively inject latent visual evidence into the SAM sparse prompt.
 

@@ -715,6 +715,7 @@ def parse_args(args):
         choices=[
             "legacy",
             "faithful_evidence_fusion",
+            "decoupled_evidence_prompt",
             "sparse_dense",
             "bounded_sparse_dense",
             "latent_sparse_dense_dia",
@@ -862,6 +863,7 @@ def main(args):
         "sparse_dense",
         "bounded_sparse_dense",
         "faithful_evidence_fusion",
+        "decoupled_evidence_prompt",
         "evidence_feedback",
     }
     if args.dia_fusion_mode in explicit_dia_modes:
@@ -1613,6 +1615,8 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
         )
     elif args.use_dia and args.dia_fusion_mode == "legacy":
         keys.extend(["res_scale", "gate_mean"])
+    elif args.use_dia and args.dia_fusion_mode == "decoupled_evidence_prompt":
+        keys.extend(["evidence_delta_ratio"])
     elif args.use_dia and args.dia_fusion_mode == "faithful_evidence_fusion":
         keys.extend(["evidence_delta_ratio", "faithful_smooth_scale"])
     elif args.use_dia and args.dia_fusion_mode == "evidence_feedback":
