@@ -121,6 +121,17 @@ def build_density_matched_description(phrase, mask):
     )
 
 
+def build_concept_only_description(phrase):
+    """Match positive prompt density without leaking a removed GT location."""
+    phrase = (phrase or "target object").strip().lower()
+    return (
+        f"target concept: {phrase}. "
+        "Remote-sensing evidence: verify characteristic shape, texture, scale, "
+        "and surrounding context wherever they are visibly supported. "
+        "Use local visual evidence rather than global scene context."
+    )
+
+
 def _clean_target_phrase(text):
     text = (text or "").replace(DEFAULT_IMAGE_TOKEN, " ")
     text = re.sub(r"<[^>]+>", " ", text)
@@ -490,13 +501,19 @@ class DIAAlignAugDataset(BaseDataset):
                 dtype=target_mask.dtype,
             )
             exists = [False]
-            answer = random.choice(self.neg_answer_list).format(
+            # A concept-only negative still runs [CON] -> visual evidence and
+            # presence supervision, but deliberately has no [SEG] mask request.
+            answer = "[CON] " + random.choice(self.neg_answer_list).format(
                 class_name=infer_phrase_from_conversation(conversations[target_idx])
             )
             variant = "target_removed_negative"
 
         phrase = infer_phrase_from_conversation(conversations[target_idx])
-        description = build_density_matched_description(phrase, target_mask)
+        description = (
+            build_density_matched_description(phrase, target_mask)
+            if is_positive
+            else build_concept_only_description(phrase)
+        )
         question = random.choice(self.question_list).format(description=description)
         conv = conversation_lib.default_conversation.copy()
         conv.append_message(conv.roles[0], question)

@@ -156,3 +156,33 @@ attention loss weight as the initial baseline. Compare:
 Report mask IoU, presence accuracy, positive attention IoU, negative maximum
 presence, and the shuffled-feature ablation. The last two metrics are important:
 mask IoU alone cannot prove that `[SEG]` was actually decoupled.
+
+## Implemented final mode
+
+`decoupled_evidence_prompt` now implements the complete training path described
+above:
+
+- positive answers use `[CON][SEG]`, while edited target-removed negatives use a
+  standalone `[CON]` and never enter SAM mask decoding;
+- a concept/evidence-only presence head is supervised on both positive and
+  negative concepts;
+- all `K` retrieved evidence tokens are retained as SAM sparse prompt tokens
+  instead of being averaged into one vector;
+- the original projected `[SEG]` prompt is used only as a detached teacher
+  target.  Its Smooth-L1 distillation weight decays to zero, and its value is
+  never an input to the student prompt or SAM decoder;
+- the launcher includes `dia_align_aug` and defaults to `K=4` so negative
+  presence supervision is active in the standard recipe.
+
+Run the final recipe with:
+
+```bash
+DIA_FUSION_MODE=decoupled_evidence_prompt \
+EXP_NAME=dia_seg_decoupled_final \
+GPU_IDS=0,1 \
+bash train_dia_lisat.sh
+```
+
+The main tunables are `PRESENCE_LOSS_WEIGHT`,
+`PROMPT_DISTILL_LOSS_WEIGHT`, `PROMPT_DISTILL_DECAY_STEPS`, and
+`DIA_NUM_EVIDENCE_TOKENS`.

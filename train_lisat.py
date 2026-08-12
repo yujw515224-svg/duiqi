@@ -567,9 +567,9 @@ def parse_args(args):
     # Dataset and training configuration
     parser.add_argument(
         "--dataset",
-        default="sem_seg||refer_seg||correct_refer_seg||vqa||neg_refer_seg||reason_seg||geo_reason_seg",
+        default="sem_seg||refer_seg||correct_refer_seg||vqa||neg_refer_seg||reason_seg||geo_reason_seg||dia_align_aug",
     )
-    parser.add_argument("--sample_rates", default="15,15,2,30,1,1,36")
+    parser.add_argument("--sample_rates", default="15,15,2,25,1,1,31,10")
     parser.add_argument("--sem_seg_data", default="ade20k||cocostuff||pascal_part||paco_lvis")
     parser.add_argument("--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog")
     parser.add_argument("--neg_refer_seg_data", default="R-refcocog||R-refcoco||R-refcoco+")
@@ -704,6 +704,10 @@ def parse_args(args):
         help="Train explicit DIA answers as adjacent [CON][SEG] token pairs.",
     )
     parser.add_argument("--attn_loss_weight", type=float, default=0.02)
+    parser.add_argument("--presence_loss_weight", type=float, default=0.20)
+    parser.add_argument("--presence_hidden_dim", type=int, default=256)
+    parser.add_argument("--prompt_distill_loss_weight", type=float, default=0.10)
+    parser.add_argument("--prompt_distill_decay_steps", type=int, default=4000)
     parser.add_argument("--dia_num_heads", type=int, default=8)
     parser.add_argument("--dia_num_evidence_tokens", type=int, default=1)
     parser.add_argument("--dia_attn_dropout", type=float, default=0.0)
@@ -1063,6 +1067,12 @@ def main(args):
         "use_mm_start_end": args.use_mm_start_end,
         "use_dia": args.use_dia,
         "attn_loss_weight": args.attn_loss_weight if args.use_dia else 0.0,
+        "presence_loss_weight": args.presence_loss_weight if args.use_dia else 0.0,
+        "presence_hidden_dim": args.presence_hidden_dim,
+        "prompt_distill_loss_weight": (
+            args.prompt_distill_loss_weight if args.use_dia else 0.0
+        ),
+        "prompt_distill_decay_steps": args.prompt_distill_decay_steps,
         "dia_num_heads": args.dia_num_heads,
         "dia_num_evidence_tokens": args.dia_num_evidence_tokens,
         "dia_attn_dropout": args.dia_attn_dropout,
@@ -1616,7 +1626,16 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
     elif args.use_dia and args.dia_fusion_mode == "legacy":
         keys.extend(["res_scale", "gate_mean"])
     elif args.use_dia and args.dia_fusion_mode == "decoupled_evidence_prompt":
-        keys.extend(["evidence_delta_ratio"])
+        keys.extend(
+            [
+                "evidence_delta_ratio",
+                "presence_loss",
+                "num_presence_positive",
+                "num_presence_negative",
+                "prompt_distill_loss",
+                "prompt_distill_weight",
+            ]
+        )
     elif args.use_dia and args.dia_fusion_mode == "faithful_evidence_fusion":
         keys.extend(["evidence_delta_ratio", "faithful_smooth_scale"])
     elif args.use_dia and args.dia_fusion_mode == "evidence_feedback":
