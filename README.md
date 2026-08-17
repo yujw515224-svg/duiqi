@@ -1,3 +1,19 @@
+# DIA-LISAt: Decoupled Image-Text Alignment for Remote Sensing Segmentation
+
+This fork adds **DIA** on top of LISAt: an explicit concept token `[CON]` carries the
+target concept, a lightweight cross-attention adapter aligns it with the dense SAM
+image features, and the aligned visual evidence is fed back into `[SEG]` for mask
+decoding. Only the token-to-mask path changes (~2M extra parameters); the RemoteCLIP
+tower, the Vicuna-7B + LoRA backbone and the SAM encoder/decoder are untouched.
+
+* Method, formulas, flags, logging and ablations: **[docs/DIA_README.md](docs/DIA_README.md)**
+* Train DIA: `bash train_dia_lisat.sh` — train the LISAt baseline: `bash train_lisat.sh`
+* CPU unit tests (no weights needed): `python tests/test_dia_modules.py && python tests/test_dia_batching.py`
+
+The original LISAt README follows.
+
+---
+
 # LISAT: Language-Instructed Segmentation Assistant for Satellite Imagery
 
 This repository provides the official PyTorch source code for our paper:  
