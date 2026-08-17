@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from dataloaders.test_dataset import TestReasoningDataset, TestReferDataset, collate_fn_test
-from model.LISAT import load_pretrained_model_LISAT
+from model.dia_lisat_model import load_pretrained_model_DIA_LISAT
 from utils import (
     prepare_input,
     intersectionAndUnionGPU,
@@ -61,7 +61,7 @@ def inference(args):
         segmentation_lmm,
         vision_tower,
         context_len,
-    ) = load_pretrained_model_LISAT(
+    ) = load_pretrained_model_DIA_LISAT(
         model_path=args.pretrained_model_path
     )
     # Load bf16 datatype

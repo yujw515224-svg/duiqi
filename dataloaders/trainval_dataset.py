@@ -1,5 +1,3 @@
-from pydoc import text
-
 import numpy as np
 import torch
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -7,74 +5,22 @@ from model.segment_anything.utils.transforms import ResizeLongestSide
 from .reason_seg_dataset import ReasonSegDataset
 from .qa_template import SHORT_ANSWER_TEMPLATE, SHORT_QUESTION_TEMPLATE, NEG_ANSWER_TEMPLATE
 from .utils import replace_image_tokens, tokenize_and_pad, handle_conversation_specifics
-
-EXPLICIT_PAIR = "[CON][SEG]"
-
-
-def insert_explicit_con(conversation):
-    """Convert an original LISAt [SEG] answer into the explicit DIA token pair."""
-    if "[CON]" in conversation:
-        remainder = conversation.replace(EXPLICIT_PAIR, "")
-        remainder = remainder.replace("[CON]", "")
-        if "[SEG]" in remainder:
-            raise RuntimeError(
-                "Conversation contains an invalid [CON]/[SEG] sequence."
-            )
-        return conversation
-    return conversation.replace("[SEG]", EXPLICIT_PAIR)
-
-
-def _single_token_id(tokenizer, token):
-    token_ids = tokenizer(token, add_special_tokens=False).input_ids
-    if len(token_ids) != 1:
-        raise RuntimeError(f"{token} must tokenize to exactly one token, got {token_ids}.")
-    return token_ids[0]
-
-
-def validate_explicit_pairs(input_ids, attention_masks, tokenizer):
-    """Validate explicit DIA routing, including concept-only negatives.
-
-    Every ``[SEG]`` must be immediately preceded by ``[CON]``.  A standalone
-    ``[CON]`` is intentionally valid: it asks the evidence branch to verify a
-    concept without requesting mask decoding.
-    """
-    con_id = _single_token_id(tokenizer, "[CON]")
-    seg_id = _single_token_id(tokenizer, "[SEG]")
-    pair_ids = tokenizer(EXPLICIT_PAIR, add_special_tokens=False).input_ids
-    if pair_ids != [con_id, seg_id]:
-        raise RuntimeError(
-            f"{EXPLICIT_PAIR} must tokenize as adjacent [CON], [SEG], got {pair_ids}."
-        )
-
-    for row_idx, row in enumerate(input_ids):
-        valid = attention_masks[row_idx].bool()
-        valid_ids = row[valid].tolist()
-        con_pos = [idx for idx, token_id in enumerate(valid_ids) if token_id == con_id]
-        seg_pos = [idx for idx, token_id in enumerate(valid_ids) if token_id == seg_id]
-
-        if len(con_pos) < len(seg_pos):
-            raise RuntimeError(
-                "Explicit DIA cannot contain more [SEG] than [CON] tokens "
-                f"and truncation, row={row_idx}, con={len(con_pos)}, seg={len(seg_pos)}."
-            )
-        con_pos_set = set(con_pos)
-        for pair_idx, seg_i in enumerate(seg_pos):
-            if seg_i - 1 not in con_pos_set:
-                raise RuntimeError(
-                    "Explicit DIA requires every [SEG] to immediately follow [CON], "
-                    f"row={row_idx}, pair={pair_idx}, seg_pos={seg_i}."
-                )
+from .dia_conversation import insert_con_tokens_batch
 
 
 try:
     from .refer_seg_dataset import ReferSegDataset as _TrainValReferSegDataset
-except ImportError as _refer_import_error:
+except ImportError as exc:  # e.g. scikit-image missing in a RefSegRS-only setup
+    # Python clears the `except ... as` name at the end of the block, so keep a
+    # module-level copy for the deferred error message.
+    _REFER_IMPORT_ERROR = exc
+
     class _TrainValReferSegDataset(torch.utils.data.Dataset):
         def __init__(self, *args, **kwargs):
             raise ImportError(
                 "TrainValDataset requires refer_seg dependencies such as scikit-image. "
                 "RefSegRS-only training does not use this class."
-            ) from _refer_import_error
+            ) from _REFER_IMPORT_ERROR
 
 
 
@@ -83,7 +29,7 @@ def collate_fn_train(
     tokenizer=None,
     conv_type="llava_v1",
     use_mm_start_end=True,
-    explicit_con_in_conversation=False,
+    con_style="clause",
 ):
     image_path_list = []
     images_list = []
@@ -114,11 +60,8 @@ def collate_fn_train(
     if use_mm_start_end:
         conversation_list = replace_image_tokens(conversation_list)
 
-    if explicit_con_in_conversation:
-        conversation_list = [
-            insert_explicit_con(conversation)
-            for conversation in conversation_list
-        ]
+    if con_style:
+        conversation_list = insert_con_tokens_batch(conversation_list, con_style)
 
     # Tokenization and padding of input IDs
     input_ids, attention_masks = tokenize_and_pad(conversation_list, tokenizer)
@@ -133,9 +76,6 @@ def collate_fn_train(
         input_ids = input_ids[:, :truncate_len]
         targets = targets[:, :truncate_len]
         attention_masks = attention_masks[:, :truncate_len]
-
-    if explicit_con_in_conversation:
-        validate_explicit_pairs(input_ids, attention_masks, tokenizer)
 
     return {
         "image_paths": image_path_list,
@@ -172,11 +112,6 @@ class HybridDataset(torch.utils.data.Dataset):
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         geo_reason_seg_data="geo_reason_seg|train",
-        dia_align_aug_source_dataset="sem_seg||refer_seg||reason_seg||geo_reason_seg",
-        dia_align_aug_source_rates="15,15,1,36",
-        dia_align_aug_positive_prob=0.5,
-        dia_align_aug_background_scale=0.2,
-        dia_align_aug_mask_dilation=2,
     ):
         self.samples_per_epoch = samples_per_epoch
         sample_rate = np.array(sample_rate)
@@ -280,56 +215,6 @@ class HybridDataset(torch.utils.data.Dataset):
                         num_classes_per_sample,
                     )
                 )
-            elif dataset == "refsegrs_dia_align":
-                from .refsegrs_dia_align_dataset import RefSegRSDIAAlignDataset
-                self.all_datasets.append(
-                    RefSegRSDIAAlignDataset(
-                        base_image_dir,
-                        vision_tower,
-                        samples_per_epoch,
-                        image_size,
-                        num_classes_per_sample,
-                        split="train",
-                        is_train=True,
-                    )
-                )
-            elif dataset == "refsegrs_dia_align_4":
-                from .refsegrs_dia_align_dataset import RefSegRSDIAAlignDataset
-                self.all_datasets.append(
-                    RefSegRSDIAAlignDataset(
-                        base_image_dir,
-                        vision_tower,
-                        samples_per_epoch,
-                        image_size,
-                        num_classes_per_sample,
-                        split="train",
-                        is_train=True,
-                        align_root_name="RefSegRS_DIAAlign_4",
-                    )
-                )
-            elif dataset == "dia_align_aug":
-                from .dia_align_aug_dataset import DIAAlignAugDataset
-
-                self.all_datasets.append(
-                    DIAAlignAugDataset(
-                        base_image_dir,
-                        vision_tower,
-                        samples_per_epoch,
-                        image_size,
-                        num_classes_per_sample,
-                        source_dataset=dia_align_aug_source_dataset,
-                        source_sample_rate=dia_align_aug_source_rates,
-                        sem_seg_data=sem_seg_data,
-                        refer_seg_data=refer_seg_data,
-                        neg_refer_seg_data=neg_refer_seg_data,
-                        correct_refer_seg_data=correct_refer_seg_data,
-                        reason_seg_data=reason_seg_data,
-                        geo_reason_seg_data=geo_reason_seg_data,
-                        positive_prob=dia_align_aug_positive_prob,
-                        background_scale=dia_align_aug_background_scale,
-                        mask_dilation=dia_align_aug_mask_dilation,
-                    )
-                )
             else:
                 raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -347,7 +232,7 @@ def collate_fn_val(
     tokenizer=None,
     use_mm_start_end=True,
     padding="right",
-    explicit_con_in_conversation=False,
+    con_style="clause",
 ):
     image_path_list = []
     images_list = []
@@ -378,17 +263,11 @@ def collate_fn_val(
     if use_mm_start_end:
         conversation_list = replace_image_tokens(conversation_list)
 
-    if explicit_con_in_conversation:
-        conversation_list = [
-            insert_explicit_con(conversation)
-            for conversation in conversation_list
-        ]
+    if con_style:
+        conversation_list = insert_con_tokens_batch(conversation_list, con_style)
 
     # Tokenization and padding of input IDs
     input_ids, attention_masks = tokenize_and_pad(conversation_list, tokenizer, padding=padding)
-
-    if explicit_con_in_conversation:
-        validate_explicit_pairs(input_ids, attention_masks, tokenizer)
 
     return {
         "image_paths": image_path_list,
