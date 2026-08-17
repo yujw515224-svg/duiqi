@@ -29,6 +29,16 @@ def add_dia_args(parser):
     """Register the DIA flags on an existing ``argparse`` parser."""
     group = parser.add_argument_group("DIA-LISAt")
     group.add_argument(
+        "--baseline_lisat",
+        action="store_true",
+        default=False,
+        help=(
+            "Train the unmodified LISAt (no [CON], no adapter, no fusion). Use "
+            "this for the ablation baseline so that the comparison runs through "
+            "exactly the same data pipeline, schedule and evaluation code."
+        ),
+    )
+    group.add_argument(
         "--dia_attn_loss_weight",
         type=float,
         default=DIA_DEFAULTS["dia_attn_loss_weight"],
