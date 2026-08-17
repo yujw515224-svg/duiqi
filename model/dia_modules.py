@@ -16,6 +16,7 @@ This file is backbone agnostic: it only depends on torch, which makes it easy to
 unit-test on CPU without any checkpoint (see tests/test_dia_modules.py).
 """
 
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -512,6 +513,16 @@ def decode_masks_with_sam(
     Byte-for-byte the behaviour of LISAt's ``generate_pred_masks``; kept here so
     the DIA path stays independent from local edits to ``model/LISAT.py``.
     """
+    if os.environ.get("DIA_DEBUG_DTYPE") == "1":
+        first = next((p for p in prompt_embeddings if p is not None), None)
+        print(
+            "[DIA][dtype] prompt="
+            + (str(first.dtype) if first is not None else "none")
+            + f" image_embeddings={image_embeddings.dtype}"
+            + f" mask_decoder={next(visual_model.mask_decoder.parameters()).dtype}",
+            flush=True,
+        )
+
     pred_masks: List[torch.Tensor] = []
     for i, prompt in enumerate(prompt_embeddings):
         input_size, original_size = sam_mask_shape_list[i][0], sam_mask_shape_list[i][1]
@@ -532,10 +543,15 @@ def decode_masks_with_sam(
         sparse_embeddings, dense_embeddings = visual_model.prompt_encoder(
             points=None, boxes=None, masks=None, text_embeds=prompt.unsqueeze(1)
         )
-        sparse_embeddings = sparse_embeddings.to(prompt.dtype)
+        # SAM's prompt encoder seeds `sparse_embeddings` with a fp32
+        # `torch.empty`, and `torch.cat` promotes the prompt to fp32 with it;
+        # everything handed to the decoder is therefore pinned to the decoder's
+        # own dtype (bf16 under DeepSpeed), or its q_proj raises a dtype error.
+        decoder_dtype = dense_embeddings.dtype
+        sparse_embeddings = sparse_embeddings.to(decoder_dtype)
         low_res_masks, _ = visual_model.mask_decoder(
-            image_embeddings=image_embeddings[i].unsqueeze(0),
-            image_pe=visual_model.prompt_encoder.get_dense_pe(),
+            image_embeddings=image_embeddings[i].unsqueeze(0).to(decoder_dtype),
+            image_pe=visual_model.prompt_encoder.get_dense_pe().to(decoder_dtype),
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=False,
