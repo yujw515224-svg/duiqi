@@ -18,6 +18,7 @@ from dataloaders.dia_conversation import (  # noqa: E402
 )
 from model.dia_modules import (  # noqa: E402
     ConceptToEvidenceAdapter,
+    has_meta_parameters,
     EvidenceGuidedFusion,
     attention_alignment_loss,
     attention_mass_in_mask,
@@ -160,6 +161,23 @@ def test_fusion_is_identity_at_initialisation():
     z, stats = fusion(prompt, torch.randn(5, 16))
     assert torch.allclose(z, prompt, atol=1e-6)
     assert float(stats["delta_ratio"]) == 0.0
+
+
+def test_meta_parameters_are_detected():
+    """from_pretrained(low_cpu_mem_usage=True) leaves new modules on meta.
+
+    Those carry no data, so .to(device) raises and they must be rebuilt --
+    this check is what tells the model to do so.
+    """
+    with torch.device("meta"):
+        meta_adapter = ConceptToEvidenceAdapter(llm_dim=16, visual_dim=16, embed_dim=16, num_heads=2)
+        meta_fusion = EvidenceGuidedFusion(prompt_dim=16, evidence_dim=16, hidden_dim=16)
+    assert has_meta_parameters(meta_adapter)
+    assert has_meta_parameters(meta_fusion)
+
+    real = ConceptToEvidenceAdapter(llm_dim=16, visual_dim=16, embed_dim=16, num_heads=2)
+    assert not has_meta_parameters(real)
+    assert not has_meta_parameters(None)
 
 
 def test_reset_dia_parameters_restores_the_identity_property():

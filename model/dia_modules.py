@@ -26,6 +26,7 @@ __all__ = [
     "ConceptToEvidenceAdapter",
     "EvidenceGuidedFusion",
     "attention_alignment_loss",
+    "has_meta_parameters",
     "attention_mass_in_mask",
     "build_special_token_mask",
     "compute_dia_prompts",
@@ -34,6 +35,22 @@ __all__ = [
     "rows_to_image_index",
     "split_by_token_offset",
 ]
+
+
+def has_meta_parameters(module: Optional[nn.Module]) -> bool:
+    """True if any parameter/buffer of ``module`` still lives on the meta device.
+
+    ``from_pretrained(low_cpu_mem_usage=True)`` builds the whole model on meta
+    and only materialises the tensors it finds in the checkpoint. Modules that
+    are *not* in the checkpoint -- such as the DIA adapter on the first run --
+    can therefore stay on meta, where ``.to(device)`` raises. Such a module has
+    to be rebuilt, not moved.
+    """
+    if module is None:
+        return False
+    return any(t.is_meta for t in module.parameters()) or any(
+        t.is_meta for t in module.buffers()
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -35,6 +35,7 @@ from .dia_modules import (
     attention_mass_in_mask,
     build_special_token_mask,
     compute_dia_prompts,
+    has_meta_parameters,
     decode_masks_with_sam,
     rows_to_image_index,
     split_by_token_offset,
@@ -102,10 +103,19 @@ class DIALISATForCausalLM(LISATForCausalLM):
     # ------------------------------------------------------------------ #
     # module construction
     # ------------------------------------------------------------------ #
-    def initialize_dia_modules(self, config) -> None:
-        """Create the two DIA modules on ``self.model`` (idempotent)."""
-        if getattr(self.model, "dia_adapter", None) is not None:
-            return
+    def initialize_dia_modules(self, config, force: bool = False) -> None:
+        """Create the two DIA modules on ``self.model``.
+
+        Idempotent, with one exception: modules left on the *meta* device by
+        ``from_pretrained(low_cpu_mem_usage=True)`` carry no data and cannot be
+        moved to a GPU, so they are rebuilt. This mirrors how LISAt re-runs
+        ``initialize_lisat_modules`` after loading.
+        """
+        adapter = getattr(self.model, "dia_adapter", None)
+        fusion = getattr(self.model, "dia_fusion", None)
+        if adapter is not None and fusion is not None and not force:
+            if not (has_meta_parameters(adapter) or has_meta_parameters(fusion)):
+                return
         out_dim = getattr(config, "out_dim", 256)
         self.model.dia_adapter = ConceptToEvidenceAdapter(
             llm_dim=config.hidden_size,
@@ -527,6 +537,7 @@ def load_pretrained_model_DIA_LISAT(
         model.enable_input_require_grads()
         model.gradient_checkpointing_enable()
 
+    model.initialize_dia_modules(model.config)
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     if not vision_tower.is_loaded:
