@@ -441,8 +441,8 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="Train DIA-LISAt Model")
 
     # Model paths
-    parser.add_argument("--version", default="/root/autodl-tmp/DIA-LISAt_code/model/LISAT_PRE-7b-local-remoteclip")
-    parser.add_argument("--vision-tower", default="/root/autodl-tmp/DIA-LISAt_code/model/remote_clip_vit_l_14")
+    parser.add_argument("--version", default="./model/LISAT_PRE-7b-local-remoteclip")
+    parser.add_argument("--vision-tower", default="./model/remote_clip_vit_l_14")
     # Precision settings
     parser.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
     parser.add_argument("--load_in_8bit", action="store_true")
@@ -486,8 +486,8 @@ def parse_args(args):
     parser.add_argument("--vis_dir", default="", help="Optional visualization output directory. Defaults to log_dir/visualizations.")
 
     # Directories
-    parser.add_argument("--dataset_dir", default="/root/autodl-tmp/LISAt_code/dataset")
-    parser.add_argument("--log_base_dir", default="/root/autodl-tmp/DIA-LISAt_code/runs")
+    parser.add_argument("--dataset_dir", default="./dataset")
+    parser.add_argument("--log_base_dir", default="./runs")
     parser.add_argument("--exp_name", default="dia_lisat_lr5e")
 
     # Training hyperparameters
@@ -543,7 +543,7 @@ def parse_args(args):
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--conv_type", choices=["llava_v1", "llava_llama_2"], default="llava_v1")
-    parser.add_argument("--vision_pretrained", default="/root/autodl-tmp/DIA-LISAt_code/sam_vit_h_4b8939.pth")
+    parser.add_argument("--vision_pretrained", default="./sam_vit_h_4b8939.pth")
     parser.add_argument("--out_dim", type=int, default=256)
 
     # Eval VQA captioning files
