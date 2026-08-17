@@ -32,6 +32,7 @@ from datetime import datetime
 from PIL import Image, ImageDraw
 
 # Model & Data
+from model.LISAT import init_LISAT_model
 from model.dia_lisat_model import init_dia_lisat_model
 from dia_integration import add_dia_args, build_dia_model_args, DIA_LOG_KEYS
 from model.llava import conversation as conversation_lib
@@ -586,8 +587,13 @@ def main(args):
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
     }
-    model_args.update(build_dia_model_args(args))
-    tokenizer, model, vision_tower = init_dia_lisat_model(args, model_args)
+    if args.baseline_lisat:
+        # Ablation baseline: plain LISAt, same data pipeline and schedule.
+        args.con_style = "none"
+        tokenizer, model, vision_tower = init_LISAT_model(args, model_args)
+    else:
+        model_args.update(build_dia_model_args(args))
+        tokenizer, model, vision_tower = init_dia_lisat_model(args, model_args)
     # from IPython import embed; embed()
     # Setup DDP
     world_size = torch.cuda.device_count()
@@ -1045,7 +1051,7 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
         "mask_bce_loss",
         "mask_dice_loss",
         "mask_loss",
-    ] + DIA_LOG_KEYS
+    ] + ([] if args.baseline_lisat else DIA_LOG_KEYS)
     loss_meters = {k: AverageMeter(k, ":.4f") for k in keys}
 
     progress = ProgressMeter(
@@ -1070,7 +1076,10 @@ def train_one_epoch(train_loader, model, epoch, scheduler, train_iter, args):
             output_dict = model(**input_dict)
 
             batch_size = input_dict["images"].size(0)
-            num_valid_attn = output_dict["num_valid_attn_masks"].item()
+            num_valid_attn = (
+                0.0 if args.baseline_lisat
+                else output_dict["num_valid_attn_masks"].item()
+            )
             for k in keys:
                 if k in valid_attention_keys:
                     if num_valid_attn > 0:

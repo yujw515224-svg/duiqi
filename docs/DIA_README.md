@@ -134,7 +134,8 @@ bash train_dia_lisat.sh
 | `--dia_attn_loss_mode` | `mass` | `mass`（推荐）或 `kl` |
 | `--dia_max_delta_ratio` | 0.5 | prompt 残差上限；调到 0.1 更保守，≤0 关闭 |
 | `--dia_num_heads` / `--dia_embed_dim` | 8 / 256 | 适配器容量 |
-| `--con_style` | `clause` | `clause` / `adjacent` |
+| `--con_style` | `clause` | `clause` / `adjacent` / `none` |
+| `--baseline_lisat` | – | 训练原版 LISAt 做对照，自动关掉 `[CON]` 注入 |
 | `--no_dia_use_dense_pe` | – | 关掉给 K/V 加 SAM 位置编码（消融用） |
 
 ### 日志怎么读
@@ -153,7 +154,7 @@ bash train_dia_lisat.sh
 
 | 设置 | 命令 | 想说明的问题 |
 | --- | --- | --- |
-| baseline | `bash train_lisat.sh` | LISAt |
+| baseline | `--baseline_lisat` | 原版 LISAt（同一套数据管线/调度/评测，唯一公平的对照） |
 | + 适配器，无对齐监督 | `--dia_attn_loss_weight 0` | 光加参数有没有用 |
 | **完整 DIA** | 默认 | 主结果 |
 | 概念查询用 `h_SEG` | `--con_style none` | **`[CON]` 解耦本身的贡献**（无 `[CON]` 时自动退化为用 `h_SEG` 当 query） |
