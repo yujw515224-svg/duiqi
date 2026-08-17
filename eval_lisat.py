@@ -32,6 +32,8 @@ def parse_args(args):
     parser.add_argument("--image_size", default=1024, type=int)
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--val_dataset", default="GeoReasonSeg", type=str)
+    parser.add_argument("--eval_split", default="test", choices=["train", "val", "test"],
+                        help="Which GeoReasonSeg split to evaluate (test = the paper protocol).")
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
     parser.add_argument("--conv_type", default="llava_v1", choices=["llava_v1", "llava_llama_2"])
     return parser.parse_args(args)
@@ -83,7 +85,7 @@ def inference(args):
             vision_tower.image_processor,
             args.image_size,
             datasetname=args.val_dataset,
-            train_test_split="test" # modify to "large" or "small" if you want to eval on splitted eval dataset
+            train_test_split=args.eval_split,
         )
     elif args.val_dataset in refer_seg_dataset:
         test_dataset = TestReferDataset(
